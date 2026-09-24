@@ -1,0 +1,9 @@
+{
+  "name": "pba-data-server",
+  "version": "1.0.0",
+  "description": "Firebase-RTDB-compatible JSON data server for the PBA site, deployed on Railway",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED"
+}
