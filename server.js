@@ -25,6 +25,17 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s =>
 const IMPORT_URL = process.env.FIREBASE_IMPORT_URL || '';    // one-time import when DB is empty
 const MAX_BODY = 25 * 1024 * 1024;
 
+// Roblox sign-in (OAuth 2.0). Set these in Railway → Variables.
+const ROBLOX_CLIENT_ID = process.env.ROBLOX_CLIENT_ID || '';
+const ROBLOX_CLIENT_SECRET = process.env.ROBLOX_CLIENT_SECRET || '';
+// Where this server lives publicly (Railway sets RAILWAY_PUBLIC_DOMAIN automatically).
+const PUBLIC_URL = (process.env.PUBLIC_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : '')).replace(/\/+$/, '');
+// Websites allowed to receive a login (comma-separated). Logins are only ever sent back to these.
+const SITE_ORIGINS = (process.env.SITE_ORIGINS || 'https://pbarblx.org,https://www.pbarblx.org')
+  .split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
+
 // ─────────────────────────── storage ───────────────────────────
 fs.mkdirSync(DATA_DIR, { recursive: true });
 let root = null;
@@ -153,6 +164,147 @@ async function authorizeWrite(req, url, affectedPaths) {
   return null;
 }
 
+// ─────────────────────── Roblox sign-in ───────────────────────
+// Sessions are kept in their own file (NOT in db.json, which anyone can read).
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+let sessions = {};
+try { if (fs.existsSync(SESSIONS_FILE)) sessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')) || {}; } catch { sessions = {}; }
+let sessTimer = null;
+function saveSessions() {
+  clearTimeout(sessTimer);
+  sessTimer = setTimeout(() => {
+    const now = Date.now();
+    for (const [k, v] of Object.entries(sessions)) if (!v || v.exp < now) delete sessions[k];
+    const tmp = SESSIONS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(sessions));
+    fs.renameSync(tmp, SESSIONS_FILE);
+  }, 200);
+}
+const pendingLogins = new Map(); // state -> { verifier, returnTo, exp }
+function b64url(buf) { return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function safeReturn(raw) {
+  try {
+    const u = new URL(raw);
+    const origin = u.origin;
+    const local = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+    if (SITE_ORIGINS.includes(origin) || local) { u.hash = ''; return u.toString(); }
+  } catch {}
+  return SITE_ORIGINS[0] ? SITE_ORIGINS[0] + '/' : null;
+}
+function redirect(res, to) { res.writeHead(302, { Location: to, 'Cache-Control': 'no-store' }); res.end(); }
+function callbackUrl(req) {
+  return (PUBLIC_URL || ('https://' + req.headers.host)) + '/auth/roblox/callback';
+}
+function publicUser(rec) {
+  return { robloxId: rec.robloxId, username: rec.username, displayName: rec.displayName, avatar: rec.avatar || '' };
+}
+
+async function handleAuth(req, res, url) {
+  // 1) Send the player to Roblox's login / authorize page.
+  if (url.pathname === '/auth/roblox/start' && req.method === 'GET') {
+    const returnTo = safeReturn(url.searchParams.get('return') || '');
+    if (!ROBLOX_CLIENT_ID || !ROBLOX_CLIENT_SECRET) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      return res.end('Roblox sign-in is not configured yet (missing ROBLOX_CLIENT_ID / ROBLOX_CLIENT_SECRET).');
+    }
+    if (!returnTo) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Unknown website. Add it to SITE_ORIGINS.'); }
+    const state = b64url(crypto.randomBytes(24));
+    const verifier = b64url(crypto.randomBytes(32));
+    const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
+    pendingLogins.set(state, { verifier, returnTo, exp: Date.now() + 10 * 60 * 1000 });
+    for (const [k, v] of pendingLogins) if (v.exp < Date.now()) pendingLogins.delete(k);
+    const q = new URLSearchParams({
+      client_id: ROBLOX_CLIENT_ID,
+      redirect_uri: callbackUrl(req),
+      scope: 'openid profile',
+      response_type: 'code',
+      state,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    });
+    return redirect(res, 'https://apis.roblox.com/oauth/v1/authorize?' + q.toString());
+  }
+
+  // 2) Roblox sends the player back here with a one-time code.
+  if (url.pathname === '/auth/roblox/callback' && req.method === 'GET') {
+    const state = url.searchParams.get('state') || '';
+    const pending = pendingLogins.get(state);
+    pendingLogins.delete(state);
+    if (!pending || pending.exp < Date.now()) {
+      const back = SITE_ORIGINS[0] ? SITE_ORIGINS[0] + '/' : null;
+      if (back) return redirect(res, back + '#pba_auth_error=' + encodeURIComponent('Login expired, please try again'));
+      res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Login expired, please try again.');
+    }
+    const fail = msg => redirect(res, pending.returnTo + '#pba_auth_error=' + encodeURIComponent(msg));
+    if (url.searchParams.get('error')) return fail('Roblox sign-in was cancelled');
+    const code = url.searchParams.get('code');
+    if (!code) return fail('Roblox did not return a login code');
+    try {
+      const tokRes = await fetch('https://apis.roblox.com/oauth/v1/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: ROBLOX_CLIENT_ID,
+          client_secret: ROBLOX_CLIENT_SECRET,
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: callbackUrl(req),
+          code_verifier: pending.verifier,
+        }).toString(),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!tokRes.ok) { console.error('Roblox token error', tokRes.status, await tokRes.text()); return fail('Roblox sign-in failed'); }
+      const tok = await tokRes.json();
+      const infoRes = await fetch('https://apis.roblox.com/oauth/v1/userinfo', {
+        headers: { Authorization: 'Bearer ' + tok.access_token },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!infoRes.ok) { console.error('Roblox userinfo error', infoRes.status); return fail('Could not read your Roblox profile'); }
+      const info = await infoRes.json();
+      const robloxId = String(info.sub || '');
+      if (!/^\d+$/.test(robloxId)) return fail('Roblox returned an invalid account');
+
+      // Save / update the player's public account record.
+      const prev = getAt(root, ['accounts', robloxId]) || {};
+      const rec = {
+        robloxId,
+        username: info.preferred_username || info.nickname || prev.username || '',
+        displayName: info.name || info.nickname || prev.displayName || '',
+        avatar: info.picture || prev.avatar || '',
+        createdAt: prev.createdAt || Date.now(),
+        lastLogin: Date.now(),
+      };
+      root = setAt(root, ['accounts', robloxId], rec);
+      scheduleSave();
+
+      const token = b64url(crypto.randomBytes(32));
+      sessions[crypto.createHash('sha256').update(token).digest('hex')] = { robloxId, exp: Date.now() + SESSION_DAYS * 86400000 };
+      saveSessions();
+      return redirect(res, pending.returnTo + '#pba_session=' + token);
+    } catch (e) {
+      console.error('Roblox sign-in error:', e.message);
+      return fail('Could not reach Roblox, please try again');
+    }
+  }
+
+  // 3) Who is signed in?   4) Sign out.
+  if ((url.pathname === '/auth/me' && req.method === 'GET') || (url.pathname === '/auth/logout' && req.method === 'POST')) {
+    const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+    const key = m ? crypto.createHash('sha256').update(m[1]).digest('hex') : '';
+    const sess = key && sessions[key];
+    if (url.pathname === '/auth/logout') {
+      if (sess) { delete sessions[key]; saveSessions(); }
+      return send(res, 200, { ok: true });
+    }
+    if (!sess || sess.exp < Date.now()) return send(res, 401, { error: 'Not signed in' });
+    const rec = getAt(root, ['accounts', sess.robloxId]);
+    if (!rec) return send(res, 401, { error: 'Account not found' });
+    return send(res, 200, publicUser(rec));
+  }
+
+  return send(res, 404, { error: 'Not found' });
+}
+
 // ─────────────────────────── http ───────────────────────────
 function cors(req, res) {
   const origin = req.headers.origin;
@@ -188,6 +340,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/' || url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('PBA data server OK');
+  }
+  if (url.pathname.startsWith('/auth/')) {
+    try { return await handleAuth(req, res, url); }
+    catch (e) { console.error(e); return send(res, 500, { error: 'Server error' }); }
   }
   if (!url.pathname.endsWith('.json')) return send(res, 404, { error: 'Paths must end in .json' });
 
