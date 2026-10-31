@@ -196,7 +196,7 @@ function callbackUrl(req) {
   return (PUBLIC_URL || ('https://' + req.headers.host)) + '/auth/roblox/callback';
 }
 function publicUser(rec) {
-  return { robloxId: rec.robloxId, username: rec.username, displayName: rec.displayName, avatar: rec.avatar || '' };
+  return { robloxId: rec.robloxId, username: rec.username, displayName: rec.displayName, avatar: rec.avatar || '', createdAt: rec.createdAt || null };
 }
 
 async function handleAuth(req, res, url) {
