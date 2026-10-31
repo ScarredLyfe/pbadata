@@ -283,6 +283,7 @@ async function handleAuth(req, res, url) {
         acceptedTermsAt: Date.now(),
       };
       root = setAt(root, ['accounts', robloxId], rec);
+      ensurePlayerRecord(rec);
       scheduleSave();
 
       const token = b64url(crypto.randomBytes(32));
@@ -417,6 +418,41 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ─────────────────────── one-time import from Firebase ───────────────────────
+// Every account gets a player record (so they appear on the Players page and admins can
+// put them on a team). Linked by Roblox ID; starts as a Free Agent with no stats.
+function ensurePlayerRecord(rec) {
+  const db = getAt(root, ['data', 'playerdb']) || {};
+  const key = Object.keys(db).find(k => String((db[k] || {}).robloxId || '') === String(rec.robloxId));
+  const name = rec.displayName || rec.username;
+  if (!key) {
+    root = setAt(root, ['data', 'playerdb', 'rbx_' + rec.robloxId], {
+      name, robloxId: rec.robloxId, username: rec.username, code: '', pos: '', num: '',
+      fromAccount: true, createdAt: Date.now(),
+    });
+  } else if (db[key].fromAccount) {
+    // Keep auto-created records in sync with the player's Roblox name.
+    root = setAt(root, ['data', 'playerdb', key, 'name'], name);
+    root = setAt(root, ['data', 'playerdb', key, 'username'], rec.username);
+  }
+  scheduleSave();
+}
+
+// One-time cleanup: remove the 36 sample players the admin panel used to seed.
+const PLACEHOLDER_NAMES = new Set(["J. Marsh", "P. Ibrahim", "O. Castillo", "R. Calloway", "T. Okafor", "J. Farrow", "A. Whitlock", "D. Reyes", "K. Mbeki", "K. Voss", "E. Marchetti", "N. Halvorsen", "M. Solis", "R. Achterberg", "J. Delgado", "G. Prentiss", "C. Ferreira", "S. Renwick", "C. Danvers", "T. Osgood", "W. Kamau", "N. Osei", "H. Vaccaro", "A. Petrova", "L. Tran", "B. Adeyemi", "F. Nakamura", "S. Okonkwo", "D. Falkenrath", "Y. Marchetti", "V. Castellano", "R. Isherwood", "Q. Beaumont", "B. Larkspur", "E. Whitfield", "I. Solano"]);
+function removePlaceholderPlayers() {
+  if (getAt(root, ['meta', 'placeholdersRemoved'])) return;
+  const db = getAt(root, ['data', 'playerdb']) || {};
+  let removed = 0;
+  for (const [k, p] of Object.entries(db)) {
+    if (p && !p.robloxId && PLACEHOLDER_NAMES.has(p.name)) { root = setAt(root, ['data', 'playerdb', k], null); removed++; }
+  }
+  root = setAt(root, ['meta', 'placeholdersRemoved'], Date.now());
+  // Make sure everyone who already signed in has a player record.
+  Object.values(getAt(root, ['accounts']) || {}).forEach(a => { if (a && a.robloxId) ensurePlayerRecord(a); });
+  saveNow();
+  console.log('Removed ' + removed + ' placeholder players');
+}
+
 async function maybeImport() {
   if (root !== null || !IMPORT_URL) return;
   const base = IMPORT_URL.replace(/\/+$/, '');
@@ -432,6 +468,7 @@ async function maybeImport() {
 }
 
 maybeImport().finally(() => {
+  try { removePlaceholderPlayers(); } catch (e) { console.error('Placeholder cleanup failed:', e.message); }
   server.listen(PORT, () => {
     console.log(`PBA data server on :${PORT}  data=${DB_FILE}  auth=${REQUIRE_AUTH ? 'discord' : 'OFF'}`);
     if (!process.env.DATA_DIR && !process.env.RAILWAY_VOLUME_MOUNT_PATH && process.env.RAILWAY_ENVIRONMENT) {
