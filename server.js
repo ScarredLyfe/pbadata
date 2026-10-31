@@ -208,10 +208,16 @@ async function handleAuth(req, res, url) {
       return res.end('Roblox sign-in is not configured yet (missing ROBLOX_CLIENT_ID / ROBLOX_CLIENT_SECRET).');
     }
     if (!returnTo) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('Unknown website. Add it to SITE_ORIGINS.'); }
+    // The player must have accepted the Terms of Use and Privacy Policy on the site first.
+    const agreed = (url.searchParams.get('agree') || '').split(',');
+    const legalVersion = (url.searchParams.get('v') || '').slice(0, 20);
+    if (!agreed.includes('terms') || !agreed.includes('privacy') || !legalVersion) {
+      return redirect(res, returnTo + '#pba_auth_error=' + encodeURIComponent('Please accept the Terms of Use and Privacy Policy first'));
+    }
     const state = b64url(crypto.randomBytes(24));
     const verifier = b64url(crypto.randomBytes(32));
     const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
-    pendingLogins.set(state, { verifier, returnTo, exp: Date.now() + 10 * 60 * 1000 });
+    pendingLogins.set(state, { verifier, returnTo, legalVersion, exp: Date.now() + 10 * 60 * 1000 });
     for (const [k, v] of pendingLogins) if (v.exp < Date.now()) pendingLogins.delete(k);
     const q = new URLSearchParams({
       client_id: ROBLOX_CLIENT_ID,
@@ -273,6 +279,8 @@ async function handleAuth(req, res, url) {
         avatar: info.picture || prev.avatar || '',
         createdAt: prev.createdAt || Date.now(),
         lastLogin: Date.now(),
+        acceptedTermsVersion: pending.legalVersion,
+        acceptedTermsAt: Date.now(),
       };
       root = setAt(root, ['accounts', robloxId], rec);
       scheduleSave();
