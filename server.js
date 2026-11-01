@@ -157,7 +157,7 @@ function permsOf(discordId) {
 // Which section(s) allow writing to a path. null = super admin only.
 function sectionsForPath(segs) {
   const [a, b] = segs;
-  if (a === 'data' && b === 'teams') return ['teams'];
+  if (a === 'data' && (b === 'teams' || b === 'structure')) return ['teams'];   // teams + conferences/divisions
   if (a === 'schedule') return ['schedule', 'stats'];   // matchups (Schedule) and scores (Stats & Score)
   // A season's week count and series layout can be edited from Schedule / Series too.
   if (a === 'seasons' && segs.length >= 3 && ['regWeeks', 'seriesConfig'].includes(segs[2])) return ['seasons', 'schedule'];
