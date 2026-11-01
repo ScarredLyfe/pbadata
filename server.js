@@ -137,18 +137,38 @@ async function discordIdFromToken(token) {
   if (tokenCache.size > 500) tokenCache.delete(tokenCache.keys().next().value);
   return u.id || null;
 }
-function roleOf(discordId) {
+// ─────────── Admin permissions (LAU-style: per-section grants) ───────────
+// data/adminAccess/<discordId> = { name, sections: ['teams','stats',...] }
+// Super admins (SUPER_ADMIN_DISCORD_IDS, or a legacy role:'super') can do everything,
+// including managing access. Older role:'regular' records keep what they had before.
+const ALL_SECTIONS = ['teams', 'stats', 'schedule', 'seasons', 'bracket', 'accolades'];
+function permsOf(discordId) {
   if (!discordId) return null;
-  if (SUPER_ADMIN_IDS.includes(discordId)) return 'super';
+  if (SUPER_ADMIN_IDS.includes(discordId)) return { super: true, sections: ALL_SECTIONS };
   const rec = getAt(root, ['data', 'adminAccess', discordId]);
-  return rec && (rec.role === 'super' || rec.role === 'regular') ? rec.role : null;
+  if (!rec) return null;
+  if (rec.role === 'super') return { super: true, sections: ALL_SECTIONS };
+  let sections = rec.sections;
+  if (sections && !Array.isArray(sections)) sections = Object.values(sections);
+  if (!sections && rec.role === 'regular') sections = ['stats', 'seasons'];
+  sections = (sections || []).filter(x => ALL_SECTIONS.includes(x));
+  return sections.length ? { super: false, sections } : null;
 }
-// Does a write to `segs` touch data/adminAccess (itself, a parent, or a child)?
-function touchesAdminAccess(segs) {
-  const target = ['data', 'adminAccess'];
-  const n = Math.min(segs.length, target.length);
-  for (let i = 0; i < n; i++) if (segs[i] !== target[i]) return false;
-  return true;
+// Which section(s) allow writing to a path. null = super admin only.
+function sectionsForPath(segs) {
+  const [a, b] = segs;
+  if (a === 'data' && b === 'teams') return ['teams'];
+  if (a === 'schedule') return ['schedule', 'stats'];   // matchups (Schedule) and scores (Stats & Score)
+  if (a === 'seasons') return ['seasons'];
+  if (a === 'bracket') return ['bracket'];
+  if (a === 'accolades') return ['accolades'];
+  return null; // data/adminAccess, data/playerdb, accounts, the root, anything else
+}
+function allowed(perms, segs) {
+  if (perms.super) return true;
+  if (!segs.length) return false;
+  const need = sectionsForPath(segs);
+  return !!need && need.some(x => perms.sections.includes(x));
 }
 async function authorizeWrite(req, url, affectedPaths) {
   const keyGiven = req.headers['x-admin-key'] || url.searchParams.get('auth');
@@ -158,9 +178,10 @@ async function authorizeWrite(req, url, affectedPaths) {
   if (!m) return [401, 'Sign in required'];
   let id;
   try { id = await discordIdFromToken(m[1]); } catch { return [503, 'Could not reach Discord to verify login']; }
-  const role = roleOf(id);
-  if (!role) return [id ? 403 : 401, id ? 'Not an admin' : 'Login expired'];
-  if (role !== 'super' && affectedPaths.some(touchesAdminAccess)) return [403, 'Super admin only'];
+  const perms = permsOf(id);
+  if (!perms) return [id ? 403 : 401, id ? 'Not an admin' : 'Login expired'];
+  const blocked = affectedPaths.find(segs => !allowed(perms, segs));
+  if (blocked) return [403, "You don't have permission to change that"];
   return null;
 }
 
