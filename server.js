@@ -220,7 +220,25 @@ function callbackUrl(req) {
   return (PUBLIC_URL || ('https://' + req.headers.host)) + '/auth/roblox/callback';
 }
 function publicUser(rec) {
-  return { robloxId: rec.robloxId, username: rec.username, displayName: rec.displayName, avatar: rec.avatar || '', createdAt: rec.createdAt || null };
+  return { robloxId: rec.robloxId, username: rec.username, displayName: rec.displayName, avatar: rec.avatar || '', createdAt: rec.createdAt || null,
+    discordId: rec.discordId || null, discordUsername: rec.discordUsername || '', discordGlobalName: rec.discordGlobalName || '', discordAvatar: rec.discordAvatar || '' };
+}
+// The signed-in player's session from "Authorization: Bearer <session token>".
+function sessionOf(req) {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  const key = m ? crypto.createHash('sha256').update(m[1]).digest('hex') : '';
+  const sess = key && sessions[key];
+  return sess && !sess.relink && sess.exp >= Date.now() ? sess : null;
+}
+const DISCORD_FIELDS = ['discordId', 'discordUsername', 'discordGlobalName', 'discordAvatar', 'discordLinkedAt'];
+// Copy (or clear, with null) a player's Discord link onto their account and player profile.
+function setDiscord(robloxId, d) {
+  const rid = String(robloxId);
+  DISCORD_FIELDS.forEach(f => { root = setAt(root, ['accounts', rid, f], d ? (d[f] ?? null) : null); });
+  const db = getAt(root, ['data', 'playerdb']) || {};
+  const pkey = Object.keys(db).find(k => String((db[k] || {}).robloxId || '') === rid);
+  if (pkey) ['discordId', 'discordUsername'].forEach(f => { root = setAt(root, ['data', 'playerdb', pkey, f], d ? (d[f] ?? null) : null); });
+  scheduleSave();
 }
 
 async function handleAuth(req, res, url) {
@@ -241,7 +259,8 @@ async function handleAuth(req, res, url) {
     const state = b64url(crypto.randomBytes(24));
     const verifier = b64url(crypto.randomBytes(32));
     const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
-    pendingLogins.set(state, { verifier, returnTo, legalVersion, exp: Date.now() + 10 * 60 * 1000 });
+    const relink = (url.searchParams.get('relink') || '').slice(0, 100);
+    pendingLogins.set(state, { verifier, returnTo, legalVersion, relink, exp: Date.now() + 10 * 60 * 1000 });
     for (const [k, v] of pendingLogins) if (v.exp < Date.now()) pendingLogins.delete(k);
     const q = new URLSearchParams({
       client_id: ROBLOX_CLIENT_ID,
@@ -306,6 +325,15 @@ async function handleAuth(req, res, url) {
         acceptedTermsVersion: pending.legalVersion,
         acceptedTermsAt: Date.now(),
       };
+      DISCORD_FIELDS.forEach(f => { if (prev[f] != null) rec[f] = prev[f]; });
+      // Linking a new Roblox account after unlinking: move the existing player profile over
+      // instead of creating a second one (avoids a stale duplicate under the old name).
+      let relinked = false;
+      if (pending.relink) {
+        const r = relinkPlayer(pending.relink, rec);
+        if (r.error) return fail(r.error);
+        relinked = r.ok;
+      }
       root = setAt(root, ['accounts', robloxId], rec);
       ensurePlayerRecord(rec);
       scheduleSave();
@@ -313,11 +341,74 @@ async function handleAuth(req, res, url) {
       const token = b64url(crypto.randomBytes(32));
       sessions[crypto.createHash('sha256').update(token).digest('hex')] = { robloxId, exp: Date.now() + SESSION_DAYS * 86400000 };
       saveSessions();
-      return redirect(res, pending.returnTo + '#pba_session=' + token);
+      return redirect(res, pending.returnTo + '#pba_session=' + token + (relinked ? '&pba_relinked=1' : ''));
     } catch (e) {
       console.error('Roblox sign-in error:', e.message);
       return fail('Could not reach Roblox, please try again');
     }
+  }
+
+  // 6) Link a Discord account to the signed-in player (step 2 of creating a profile).
+  //    The site gets a Discord token from Discord's own sign-in and sends it here; we check it with Discord.
+  if (url.pathname === '/auth/discord/link' && req.method === 'POST') {
+    const sess = sessionOf(req);
+    if (!sess) return send(res, 401, { error: 'Not signed in' });
+    let body; try { body = await readBody(req); } catch { return send(res, 400, { error: 'Bad request' }); }
+    const dtoken = body && String(body.discordToken || '');
+    if (!dtoken) return send(res, 400, { error: 'Missing Discord token' });
+    let d;
+    try {
+      const r = await fetch('https://discord.com/api/users/@me', { headers: { Authorization: 'Bearer ' + dtoken }, signal: AbortSignal.timeout(8000) });
+      if (!r.ok) return send(res, 400, { error: 'Discord sign-in expired, please try again' });
+      d = await r.json();
+    } catch { return send(res, 503, { error: 'Could not reach Discord, please try again' }); }
+    if (!d || !/^\d+$/.test(String(d.id || ''))) return send(res, 400, { error: 'Discord returned an invalid account' });
+    const rid = String(sess.robloxId);
+    if (!getAt(root, ['accounts', rid])) return send(res, 401, { error: 'Account not found' });
+    // One Discord account per player.
+    const accts = getAt(root, ['accounts']) || {};
+    const taken = Object.keys(accts).find(k => k !== rid && String((accts[k] || {}).discordId || '') === String(d.id));
+    if (taken) return send(res, 409, { error: 'That Discord account is already linked to another player. Unlink it there first.' });
+    const avatar = d.avatar
+      ? `https://cdn.discordapp.com/avatars/${d.id}/${d.avatar}.${String(d.avatar).startsWith('a_') ? 'gif' : 'png'}?size=256`
+      : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(d.id) >> 22n) % 6}.png`;
+    setDiscord(rid, { discordId: String(d.id), discordUsername: d.username || '', discordGlobalName: d.global_name || '', discordAvatar: avatar, discordLinkedAt: Date.now() });
+    return send(res, 200, publicUser(getAt(root, ['accounts', rid])));
+  }
+  if (url.pathname === '/auth/discord/unlink' && req.method === 'POST') {
+    const sess = sessionOf(req);
+    if (!sess) return send(res, 401, { error: 'Not signed in' });
+    setDiscord(sess.robloxId, null);
+    const rec = getAt(root, ['accounts', String(sess.robloxId)]);
+    return rec ? send(res, 200, publicUser(rec)) : send(res, 401, { error: 'Account not found' });
+  }
+
+  // 5) Unlink this Roblox account. The player profile (stats, team, awards) is kept and set aside;
+  //    the returned relink token moves it onto whichever Roblox account is linked next.
+  if (url.pathname === '/auth/unlink' && req.method === 'POST') {
+    const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+    const key = m ? crypto.createHash('sha256').update(m[1]).digest('hex') : '';
+    const sess = key && sessions[key];
+    if (!sess || sess.exp < Date.now()) return send(res, 401, { error: 'Not signed in' });
+    const rid = String(sess.robloxId);
+    const acct = getAt(root, ['accounts', rid]);
+    if (acct) ensurePlayerRecord(acct);
+    const db = getAt(root, ['data', 'playerdb']) || {};
+    const pkey = Object.keys(db).find(k => String((db[k] || {}).robloxId || '') === rid);
+    if (pkey) {
+      root = setAt(root, ['data', 'playerdb', pkey, 'unlinked'], true);
+      root = setAt(root, ['data', 'playerdb', pkey, 'unlinkedAt'], Date.now());
+    }
+    root = setAt(root, ['accounts', rid], null);
+    for (const [k, v] of Object.entries(sessions)) if (v && !v.relink && String(v.robloxId) === rid) delete sessions[k];
+    let relinkToken = null;
+    if (pkey) {
+      relinkToken = b64url(crypto.randomBytes(24));
+      sessions['relink:' + crypto.createHash('sha256').update(relinkToken).digest('hex')] =
+        { relink: true, playerKey: pkey, oldRobloxId: rid, exp: Date.now() + 30 * 86400000 };
+    }
+    saveSessions(); scheduleSave();
+    return send(res, 200, { ok: true, relinkToken });
   }
 
   // 3) Who is signed in?   4) Sign out.
@@ -449,7 +540,10 @@ function ensurePlayerRecord(rec) {
   const key = Object.keys(db).find(k => String((db[k] || {}).robloxId || '') === String(rec.robloxId));
   const name = rec.displayName || rec.username;
   if (!key) {
-    root = setAt(root, ['data', 'playerdb', 'rbx_' + rec.robloxId], {
+    // The usual key is rbx_<robloxId>, unless a relinked profile still uses that key.
+    let newKey = 'rbx_' + rec.robloxId, n = 2;
+    while (db[newKey]) newKey = 'rbx_' + rec.robloxId + '_' + n++;
+    root = setAt(root, ['data', 'playerdb', newKey], {
       name, robloxId: rec.robloxId, username: rec.username, code: '', pos: '', num: '',
       fromAccount: true, createdAt: Date.now(),
     });
@@ -459,6 +553,52 @@ function ensurePlayerRecord(rec) {
     root = setAt(root, ['data', 'playerdb', key, 'username'], rec.username);
   }
   scheduleSave();
+}
+
+// Does a player record have league history (box score lines or awards)? Used before merging.
+function playerHasHistory(pid) {
+  const box = getAt(root, ['boxscores']) || {};
+  for (const sid of Object.keys(box)) for (const wk of Object.keys(box[sid] || {})) for (const gid of Object.keys(box[sid][wk] || {})) {
+    const g = box[sid][wk][gid] || {};
+    if ((g.teamA && g.teamA[pid]) || (g.teamB && g.teamB[pid])) return true;
+  }
+  const aw = getAt(root, ['awards']) || {};
+  for (const sid of Object.keys(aw)) {
+    const list = aw[sid] && aw[sid].list;
+    if ((Array.isArray(list) ? list : Object.values(list || {})).some(a => a && a.playerId === pid)) return true;
+  }
+  return false;
+}
+// Move an unlinked player profile onto a newly linked Roblox account.
+function relinkPlayer(token, rec) {
+  const skey = 'relink:' + crypto.createHash('sha256').update(String(token)).digest('hex');
+  const rel = sessions[skey];
+  if (!rel || !rel.relink || rel.exp < Date.now()) return { ok: false };
+  const db = getAt(root, ['data', 'playerdb']) || {};
+  const P = rel.playerKey;
+  if (!db[P]) { delete sessions[skey]; saveSessions(); return { ok: false }; }
+  const newId = String(rec.robloxId);
+  // A profile the new Roblox account already has: fold it in if it's empty, refuse if it has history.
+  const Q = Object.keys(db).find(k => k !== P && String((db[k] || {}).robloxId || '') === newId);
+  if (Q) {
+    if (playerHasHistory(Q)) return { error: 'That Roblox account already has its own player profile with stats. Link a different account, or ask an admin to merge them.' };
+    if (!db[P].code && db[Q].code) root = setAt(root, ['data', 'playerdb', P, 'code'], db[Q].code);
+    root = setAt(root, ['data', 'playerdb', Q], null);
+  }
+  const cur = getAt(root, ['data', 'playerdb', P]) || {};
+  // The Discord link travels with the profile to the new Roblox account.
+  if (cur.discordId && !rec.discordId) {
+    const accts = getAt(root, ['accounts']) || {};
+    const old = Object.values(accts).find(a => a && String(a.discordId || '') === String(cur.discordId));
+    if (!old) { rec.discordId = cur.discordId; rec.discordUsername = cur.discordUsername || ''; rec.discordLinkedAt = Date.now(); }
+  }
+  const next = Object.assign({}, cur, { robloxId: newId, username: rec.username, relinkedAt: Date.now(),
+    previousRobloxIds: [...new Set([...(cur.previousRobloxIds || []), String(rel.oldRobloxId)])].filter(x => x !== newId) });
+  if (cur.fromAccount !== false) next.name = rec.displayName || rec.username || cur.name;
+  delete next.unlinked; delete next.unlinkedAt;
+  root = setAt(root, ['data', 'playerdb', P], next);
+  delete sessions[skey]; saveSessions(); scheduleSave();
+  return { ok: true };
 }
 
 // One-time cleanup: remove the 36 sample players the admin panel used to seed.
