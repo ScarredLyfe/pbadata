@@ -369,6 +369,16 @@ async function handleAuth(req, res, url) {
     const accts = getAt(root, ['accounts']) || {};
     const taken = Object.keys(accts).find(k => k !== rid && String((accts[k] || {}).discordId || '') === String(d.id));
     if (taken) return send(res, 409, { error: 'That Discord account is already linked to another player. Unlink it there first.' });
+    // Clear this Discord from any other profile still holding it (e.g. one set aside by a Roblox unlink),
+    // so a Discord is only ever on one profile.
+    const pdb = getAt(root, ['data', 'playerdb']) || {};
+    Object.keys(pdb).forEach(k => {
+      const p = pdb[k] || {};
+      if (String(p.discordId || '') === String(d.id) && String(p.robloxId || '') !== rid) {
+        root = setAt(root, ['data', 'playerdb', k, 'discordId'], null);
+        root = setAt(root, ['data', 'playerdb', k, 'discordUsername'], null);
+      }
+    });
     const avatar = d.avatar
       ? `https://cdn.discordapp.com/avatars/${d.id}/${d.avatar}.${String(d.avatar).startsWith('a_') ? 'gif' : 'png'}?size=256`
       : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(d.id) >> 22n) % 6}.png`;
@@ -590,12 +600,16 @@ function relinkPlayer(token, rec) {
   if (cur.discordId && !rec.discordId) {
     const accts = getAt(root, ['accounts']) || {};
     const old = Object.values(accts).find(a => a && String(a.discordId || '') === String(cur.discordId));
-    if (!old) { rec.discordId = cur.discordId; rec.discordUsername = cur.discordUsername || ''; rec.discordLinkedAt = Date.now(); }
+    const otherProfile = Object.keys(db).find(k => k !== P && db[k] && String(db[k].discordId || '') === String(cur.discordId));
+    if (!old && !otherProfile) { rec.discordId = cur.discordId; rec.discordUsername = cur.discordUsername || ''; rec.discordLinkedAt = Date.now(); }
   }
   const next = Object.assign({}, cur, { robloxId: newId, username: rec.username, relinkedAt: Date.now(),
     previousRobloxIds: [...new Set([...(cur.previousRobloxIds || []), String(rel.oldRobloxId)])].filter(x => x !== newId) });
   if (cur.fromAccount !== false) next.name = rec.displayName || rec.username || cur.name;
   delete next.unlinked; delete next.unlinkedAt;
+  // The profile's Discord always matches the account it now belongs to (no leftover Discord from before).
+  if (rec.discordId) { next.discordId = rec.discordId; next.discordUsername = rec.discordUsername || ''; }
+  else { delete next.discordId; delete next.discordUsername; }
   root = setAt(root, ['data', 'playerdb', P], next);
   delete sessions[skey]; saveSessions(); scheduleSave();
   return { ok: true };
