@@ -189,7 +189,14 @@ async function authorizeWrite(req, url, affectedPaths) {
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   if (!m) return [401, 'Sign in required'];
   let id;
-  try { id = await discordIdFromToken(m[1]); } catch { return [503, 'Could not reach Discord to verify login']; }
+  if (m[1].startsWith('pba:')) {
+    // Signed in on the website (Roblox) with a linked Discord: use that Discord ID, no second login.
+    const sess = sessions[crypto.createHash('sha256').update(m[1].slice(4)).digest('hex')];
+    const acct = sess && !sess.relink && sess.exp >= Date.now() && getAt(root, ['accounts', String(sess.robloxId)]);
+    id = acct && acct.discordId ? String(acct.discordId) : null;
+  } else {
+    try { id = await discordIdFromToken(m[1]); } catch { return [503, 'Could not reach Discord to verify login']; }
+  }
   if (!id) return [401, 'Login expired'];
   // Each league has its own admins: check the path against that league's admin list.
   for (const segs of affectedPaths) {
