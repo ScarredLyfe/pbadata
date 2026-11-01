@@ -159,6 +159,8 @@ function sectionsForPath(segs) {
   const [a, b] = segs;
   if (a === 'data' && b === 'teams') return ['teams'];
   if (a === 'schedule') return ['schedule', 'stats'];   // matchups (Schedule) and scores (Stats & Score)
+  // A season's week count and series layout can be edited from Schedule / Series too.
+  if (a === 'seasons' && segs.length >= 3 && ['regWeeks', 'seriesConfig'].includes(segs[2])) return ['seasons', 'schedule'];
   if (a === 'seasons') return ['seasons'];
   if (a === 'bracket') return ['bracket'];
   if (a === 'accolades') return ['accolades'];
