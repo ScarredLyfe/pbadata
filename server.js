@@ -163,7 +163,8 @@ function sectionsForPath(segs) {
   if (a === 'seasons' && segs.length >= 3 && ['regWeeks', 'seriesConfig'].includes(segs[2])) return ['seasons', 'schedule'];
   if (a === 'seasons') return ['seasons'];
   if (a === 'bracket') return ['bracket'];
-  if (a === 'accolades') return ['accolades'];
+  if (a === 'accolades' || a === 'awards') return ['accolades'];   // Awards + Player of the Series
+  if (a === 'boxscores') return ['stats'];                           // player box scores (Stats & Score)
   return null; // data/adminAccess, data/playerdb, accounts, the root, anything else
 }
 function allowed(perms, segs) {
