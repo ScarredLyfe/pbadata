@@ -221,14 +221,48 @@ function callbackUrl(req) {
 }
 function publicUser(rec) {
   return { robloxId: rec.robloxId, username: rec.username, displayName: rec.displayName, avatar: rec.avatar || '', createdAt: rec.createdAt || null,
+    lastSyncAt: rec.lastSyncAt || null, nextSyncAt: rec.lastSyncAt ? rec.lastSyncAt + SYNC_COOLDOWN_MS : null,
     discordId: rec.discordId || null, discordUsername: rec.discordUsername || '', discordGlobalName: rec.discordGlobalName || '', discordAvatar: rec.discordAvatar || '' };
 }
 // The signed-in player's session from "Authorization: Bearer <session token>".
+function fmtWait(ms) {
+  const mins = Math.max(1, Math.ceil(ms / 60000)), h = Math.floor(mins / 60), m = mins % 60;
+  return h ? h + 'h' + (m ? ' ' + m + 'm' : '') : m + 'm';
+}
 function sessionOf(req) {
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   const key = m ? crypto.createHash('sha256').update(m[1]).digest('hex') : '';
   const sess = key && sessions[key];
   return sess && !sess.relink && sess.exp >= Date.now() ? sess : null;
+}
+// Roblox profile sync (username / display name / avatar): once per 24 hours per account.
+// The cooldown is stored on the account on the server, so another browser or tab can't skip it.
+const SYNC_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+async function fetchRobloxProfile(robloxId) {
+  const id = encodeURIComponent(robloxId);
+  const u = await fetch('https://users.roblox.com/v1/users/' + id, { signal: AbortSignal.timeout(8000) });
+  if (!u.ok) throw new Error('Roblox user lookup failed (' + u.status + ')');
+  const info = await u.json();
+  let avatar = '';
+  try {
+    const t = await fetch('https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=' + id + '&size=150x150&format=Png&isCircular=false', { signal: AbortSignal.timeout(8000) });
+    const tj = t.ok ? await t.json() : null;
+    const d = tj && tj.data && tj.data[0];
+    if (d && d.state === 'Completed' && d.imageUrl) avatar = d.imageUrl;
+  } catch {}
+  return { username: info.name || '', displayName: info.displayName || info.name || '', avatar };
+}
+// Apply a fresh Roblox username / display name / avatar to the account and its player profile.
+function applyRobloxProfile(rid, prof) {
+  const acct = getAt(root, ['accounts', rid]) || {};
+  const next = Object.assign({}, acct, { lastSyncAt: Date.now() });
+  if (prof.username) next.username = prof.username;
+  if (prof.displayName) next.displayName = prof.displayName;
+  if (prof.avatar) next.avatar = prof.avatar;
+  root = setAt(root, ['accounts', rid], next);
+  ensurePlayerRecord(next);   // keeps the profile's name and @username in step
+  scheduleSave();
+  return next;
 }
 const DISCORD_FIELDS = ['discordId', 'discordUsername', 'discordGlobalName', 'discordAvatar', 'discordLinkedAt'];
 // Copy (or clear, with null) a player's Discord link onto their account and player profile.
@@ -315,11 +349,15 @@ async function handleAuth(req, res, url) {
 
       // Save / update the player's public account record.
       const prev = getAt(root, ['accounts', robloxId]) || {};
+      // Signing in refreshes the Roblox name/avatar only for new accounts or when a sync is due,
+      // so signing out and back in can't be used to skip the 24-hour sync cooldown.
+      const fresh = !prev.robloxId || !prev.lastSyncAt || Date.now() - prev.lastSyncAt >= SYNC_COOLDOWN_MS;
       const rec = {
         robloxId,
-        username: info.preferred_username || info.nickname || prev.username || '',
-        displayName: info.name || info.nickname || prev.displayName || '',
-        avatar: info.picture || prev.avatar || '',
+        username: (fresh && (info.preferred_username || info.nickname)) || prev.username || '',
+        displayName: (fresh && (info.name || info.nickname)) || prev.displayName || '',
+        avatar: (fresh && info.picture) || prev.avatar || '',
+        lastSyncAt: fresh ? Date.now() : prev.lastSyncAt,
         createdAt: prev.createdAt || Date.now(),
         lastLogin: Date.now(),
         acceptedTermsVersion: pending.legalVersion,
@@ -346,6 +384,20 @@ async function handleAuth(req, res, url) {
       console.error('Roblox sign-in error:', e.message);
       return fail('Could not reach Roblox, please try again');
     }
+  }
+
+  // 7) Sync Roblox username / display name / avatar (24-hour cooldown, enforced here).
+  if (url.pathname === '/auth/roblox/sync' && req.method === 'POST') {
+    const sess = sessionOf(req);
+    if (!sess) return send(res, 401, { error: 'Not signed in' });
+    const rid = String(sess.robloxId);
+    const acct = getAt(root, ['accounts', rid]);
+    if (!acct) return send(res, 401, { error: 'Account not found' });
+    const wait = (acct.lastSyncAt || 0) + SYNC_COOLDOWN_MS - Date.now();
+    if (wait > 0) return send(res, 429, { error: 'You can sync again in ' + fmtWait(wait) + '.', nextSyncAt: acct.lastSyncAt + SYNC_COOLDOWN_MS });
+    let prof;
+    try { prof = await fetchRobloxProfile(rid); } catch (e) { console.error('Roblox sync failed:', e.message); return send(res, 503, { error: 'Could not reach Roblox, please try again' }); }
+    return send(res, 200, publicUser(applyRobloxProfile(rid, prof)));
   }
 
   // 6) Link a Discord account to the signed-in player (step 2 of creating a profile).
