@@ -209,6 +209,19 @@ function seasonLockError(before, after, base) {
   return null;
 }
 
+// Only the owner can make someone a super admin, change a super admin, or remove one.
+// (Other super admins can still add, change and remove regular admins.)
+const OWNER_ID = (process.env.OWNER_DISCORD_ID || '613513131741937684').trim();
+function superAdminError(before, after, base, writerId) {
+  if (writerId === OWNER_ID) return null;
+  const o = getAt(before, [...base, 'data', 'adminAccess']) || {}, n = getAt(after, [...base, 'data', 'adminAccess']) || {};
+  for (const id of new Set([...Object.keys(o), ...Object.keys(n)])) {
+    const wasSuper = o[id] && o[id].role === 'super', isSuper = n[id] && n[id].role === 'super';
+    if ((wasSuper || isSuper) && !sameJSON(o[id], n[id])) return 'Only the owner can add, change or remove a super admin';
+  }
+  return null;
+}
+
 // Locked games (schedule/<season>/<week>/<game>.locked, set by the super admin) can't be changed
 // by anyone else: not the score, the stats, or the lock itself.
 function gameLockError(before, after, base) {
@@ -656,6 +669,11 @@ const server = http.createServer(async (req, res) => {
     // Admins who aren't the super admin can't touch seasons that aren't active.
     for (const base of (req.writer && req.writer.limitedBases) || []) {
       const err = seasonLockError(root, next, base) || gameLockError(root, next, base);
+      if (err) return send(res, 403, { error: err });
+    }
+    // Super admin appointments are the owner's alone.
+    if (req.writer) for (const base of LEAGUE_BASES) {
+      const err = superAdminError(root, next, base, req.writer.id);
       if (err) return send(res, 403, { error: err });
     }
     root = next;
