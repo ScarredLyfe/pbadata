@@ -167,7 +167,11 @@ function permsOf(discordId, base = []) {
 function sectionsForPath(segs) {
   const [a, b] = segs;
   if (a === 'data' && (b === 'teams' || b === 'structure')) return ['teams'];   // teams + conferences/divisions
+  if (a === 'teams') return ['teams'];                   // each season's own team list: teams/<seasonId>/<code>
   if (a === 'schedule') return ['schedule', 'stats'];   // matchups (Schedule) and scores (Stats & Score)
+  // Which season is active (the one the Discord bots update) is the super admin's call only.
+  if (a === 'seasons' && segs.length >= 3 && segs[2] === 'active') return null;
+  if (a === 'seasons' && segs.length >= 3 && segs[2] === 'playoffs') return ['seasons', 'schedule', 'stats', 'bracket'];
   // A season's week count and series layout can be edited from Schedule / Series too.
   if (a === 'seasons' && segs.length >= 3 && ['regWeeks', 'seriesConfig'].includes(segs[2])) return ['seasons', 'schedule'];
   if (a === 'seasons') return ['seasons'];
@@ -182,6 +186,29 @@ function allowed(perms, segs) {
   const need = sectionsForPath(segs);
   return !!need && need.some(x => perms.sections.includes(x));
 }
+// ─────────── Active seasons ───────────
+// seasons/<id>/active marks the season the Discord bots update (one per league). Seasons that
+// aren't active are locked: only the super admin can change them or anything that belongs to
+// them (scores, stats, bracket, awards, teams, rosters). Checked by comparing the data before
+// and after a write, so it covers every way of writing (PUT, PATCH, whole-collection saves…).
+const SEASON_OWNED = ['schedule', 'boxscores', 'bracket', 'awards', 'accolades', 'teams', 'rosters'];
+const sameJSON = (a, b) => JSON.stringify(a == null ? null : a) === JSON.stringify(b == null ? null : b);
+function seasonLockError(before, after, base) {
+  const oS = getAt(before, [...base, 'seasons']) || {}, nS = getAt(after, [...base, 'seasons']) || {};
+  for (const sid of new Set([...Object.keys(oS), ...Object.keys(nS)])) {
+    const o = oS[sid], n = nS[sid];
+    if (!!(o && o.active) !== !!(n && n.active)) return 'Only the super admin can change which season is active';
+    if (o && !o.active) {
+      const label = o.label || o.name || sid;
+      if (!sameJSON(o, n)) return `${label} isn't the active season, so it's locked`;
+      for (const c of SEASON_OWNED) {
+        if (!sameJSON(getAt(before, [...base, c, sid]), getAt(after, [...base, c, sid]))) return `${label} isn't the active season, so it's locked`;
+      }
+    }
+  }
+  return null;
+}
+
 async function authorizeWrite(req, url, affectedPaths) {
   const keyGiven = req.headers['x-admin-key'] || url.searchParams.get('auth');
   if (ADMIN_KEY && keyGiven === ADMIN_KEY) return null; // full access
@@ -199,11 +226,13 @@ async function authorizeWrite(req, url, affectedPaths) {
   }
   if (!id) return [401, 'Login expired'];
   // Each league has its own admins: check the path against that league's admin list.
+  req.writer = { id, limitedBases: [] };   // leagues where this person is NOT a super admin
   for (const segs of affectedPaths) {
     const { base, rest } = splitLeague(segs);
     const perms = permsOf(id, base);
     if (!perms) return [403, 'Not an admin' + (base.length ? ' for ' + base[1].toUpperCase() : '')];
     if (!allowed(perms, rest)) return [403, "You don't have permission to change that"];
+    if (!perms.super && !req.writer.limitedBases.some(b => b.join('/') === base.join('/'))) req.writer.limitedBases.push(base);
   }
   return null;
 }
@@ -602,10 +631,17 @@ const server = http.createServer(async (req, res) => {
       if (ifMatch !== tag) return send(res, 412, current, { ETag: tag });
     }
 
-    if (req.method === 'PUT') root = setAt(root, segs, body);
-    else if (req.method === 'DELETE') root = setAt(root, segs, null);
-    else if (req.method === 'POST') root = setAt(root, segs.concat(newKey), body);
-    else for (const [k, v] of Object.entries(body)) root = setAt(root, segs.concat(k.split('/').filter(Boolean)), v);
+    let next = root;
+    if (req.method === 'PUT') next = setAt(next, segs, body);
+    else if (req.method === 'DELETE') next = setAt(next, segs, null);
+    else if (req.method === 'POST') next = setAt(next, segs.concat(newKey), body);
+    else for (const [k, v] of Object.entries(body)) next = setAt(next, segs.concat(k.split('/').filter(Boolean)), v);
+    // Admins who aren't the super admin can't touch seasons that aren't active.
+    for (const base of (req.writer && req.writer.limitedBases) || []) {
+      const err = seasonLockError(root, next, base);
+      if (err) return send(res, 403, { error: err });
+    }
+    root = next;
     scheduleSave();
 
     if (silent) { res.writeHead(204); return res.end(); }
@@ -720,6 +756,26 @@ function removePlaceholderPlayers() {
   console.log('Removed ' + removed + ' placeholder players');
 }
 
+// One-time per league: give every existing season its own copy of the team list
+// (teams/<seasonId>), and mark one season active (the default one, else the newest).
+// After this, a brand-new season starts with no teams, and old seasons keep theirs.
+function migrateSeasons() {
+  for (const B of LEAGUE_BASES) {
+    if (getAt(root, [...B, 'meta', 'perSeasonTeams'])) continue;
+    const seasons = getAt(root, [...B, 'seasons']) || {};
+    const ids = Object.keys(seasons);
+    const teams = getAt(root, [...B, 'data', 'teams']);
+    for (const sid of ids) if (teams && !getAt(root, [...B, 'teams', sid])) root = setAt(root, [...B, 'teams', sid], teams);
+    if (ids.length && !ids.some(id => seasons[id] && seasons[id].active)) {
+      const pick = ids.find(id => seasons[id] && seasons[id].isDefault) || ids[ids.length - 1];
+      root = setAt(root, [...B, 'seasons', pick, 'active'], true);
+    }
+    root = setAt(root, [...B, 'meta', 'perSeasonTeams'], Date.now());
+    console.log(`Seasons set up for ${B.length ? B[1].toUpperCase() : 'PBA'}: ${ids.length} season(s) got their own team list.`);
+  }
+  saveNow();
+}
+
 async function maybeImport() {
   if (root !== null || !IMPORT_URL) return;
   const base = IMPORT_URL.replace(/\/+$/, '');
@@ -736,6 +792,7 @@ async function maybeImport() {
 
 maybeImport().finally(() => {
   try { removePlaceholderPlayers(); } catch (e) { console.error('Placeholder cleanup failed:', e.message); }
+  try { if (root) migrateSeasons(); } catch (e) { console.error('Season setup failed:', e.message); }
   // Every account gets a player profile in each league (adds PBCA profiles for existing players).
   try {
     const accts = Object.values(getAt(root, ['accounts']) || {}).filter(a => a && a.robloxId);
