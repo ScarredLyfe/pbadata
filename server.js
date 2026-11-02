@@ -209,6 +209,23 @@ function seasonLockError(before, after, base) {
   return null;
 }
 
+// Locked games (schedule/<season>/<week>/<game>.locked, set by the super admin) can't be changed
+// by anyone else: not the score, the stats, or the lock itself.
+function gameLockError(before, after, base) {
+  const oS = getAt(before, [...base, 'schedule']) || {}, nS = getAt(after, [...base, 'schedule']) || {};
+  const keys = (a, b) => [...new Set([...Object.keys(a || {}), ...Object.keys(b || {})])];
+  for (const sid of keys(oS, nS)) for (const wk of keys(oS[sid], nS[sid])) {
+    const ow = (oS[sid] || {})[wk] || {}, nw = (nS[sid] || {})[wk] || {};
+    for (const gid of keys(ow, nw)) {
+      const o = ow[gid], n = nw[gid];
+      if (!(o && o.locked) && !(n && n.locked)) continue;
+      const box = r => getAt(r, [...base, 'boxscores', sid, wk, gid]);
+      if (!sameJSON(o, n) || !sameJSON(box(before), box(after))) return 'That game is locked. Only the super admin can change it.';
+    }
+  }
+  return null;
+}
+
 async function authorizeWrite(req, url, affectedPaths) {
   const keyGiven = req.headers['x-admin-key'] || url.searchParams.get('auth');
   if (ADMIN_KEY && keyGiven === ADMIN_KEY) return null; // full access
@@ -638,7 +655,7 @@ const server = http.createServer(async (req, res) => {
     else for (const [k, v] of Object.entries(body)) next = setAt(next, segs.concat(k.split('/').filter(Boolean)), v);
     // Admins who aren't the super admin can't touch seasons that aren't active.
     for (const base of (req.writer && req.writer.limitedBases) || []) {
-      const err = seasonLockError(root, next, base);
+      const err = seasonLockError(root, next, base) || gameLockError(root, next, base);
       if (err) return send(res, 403, { error: err });
     }
     root = next;
