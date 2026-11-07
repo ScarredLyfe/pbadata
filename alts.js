@@ -31,6 +31,14 @@ module.exports = function makeAlts(DATA_DIR) {
 
   let db = { ip: {}, dev: {}, alerts: {}, ignore: {}, seen: {} };
   try { if (fs.existsSync(FILE)) db = Object.assign(db, JSON.parse(fs.readFileSync(FILE, 'utf8')) || {}); } catch (e) { console.error('alts.json unreadable:', e.message); }
+  // Older alerts (one account pair each) → the new shape.
+  for (const a of Object.values(db.alerts)) {
+    if (!a.matches) a.matches = a.match ? { [a.match]: { ip: !!a.ip, dev: !!a.dev } } : {};
+    if (!a.pairs) a.pairs = a.pair ? [a.pair] : [];
+    delete a.pair;
+    if (a.rev == null) a.rev = 0;
+    for (const [lg, info] of Object.entries(a.posted || {})) if (info && info.rev == null) info.rev = 0;
+  }
   let timer = null;
   function save() {
     clearTimeout(timer);
@@ -81,26 +89,55 @@ module.exports = function makeAlts(DATA_DIR) {
       db.dev[dh] = db.dev[dh] || {}; db.dev[dh][key] = now;
       Object.keys(db.dev[dh]).forEach(k => { if (k !== key) (others[k] = others[k] || {}).dev = true; });
     }
-    const made = [];
+    // One alert per person: a new match for someone who already has an open alert is added to it,
+    // and the bots EDIT their message instead of posting a new one.
+    const made = [], touched = new Set();
     for (const [other, m] of Object.entries(others)) {
       const pair = [key, other].sort().join('|');
       if (db.ignore[pair]) continue;
-      const a = Object.values(db.alerts).find(x => x.pair === pair);
+      // Already in an alert (open or decided): just update it.
+      let a = Object.values(db.alerts).find(x => (x.pairs || []).includes(pair));
       if (a) {
-        a.lastAt = now; a.count = (a.count || 1) + 1;
-        const stronger = (m.ip && !a.ip) || (m.dev && !a.dev);
-        a.ip = a.ip || !!m.ip; a.dev = a.dev || !!m.dev;
-        // Became a strong match (same network AND device) while still open: post it again.
-        if (stronger && a.ip && a.dev && a.status === 'open') { a.posted = {}; a.strongAt = now; }
+        for (const k of [key, other]) if (k !== a.flagged) {
+          const mm = a.matches[k] || (a.matches[k] = {});
+          mm.ip = mm.ip || !!m.ip; mm.dev = mm.dev || !!m.dev;
+        }
+        touched.add(a);
+        continue;
+      }
+      // One of these accounts is already in an open alert: put the other one in the same alert.
+      const inIt = (x, k) => x.flagged === k || !!(x.matches || {})[k];
+      a = Object.values(db.alerts).find(x => x.status === 'open' && (inIt(x, key) || inIt(x, other)));
+      if (a) {
+        for (const k of [key, other]) if (k !== a.flagged) {
+          const mm = a.matches[k] || (a.matches[k] = {});
+          mm.ip = mm.ip || !!m.ip; mm.dev = mm.dev || !!m.dev;
+        }
+        a.pairs.push(pair);
+        touched.add(a);
         continue;
       }
       const id = now.toString(36) + crypto.randomBytes(3).toString('hex');
-      db.alerts[id] = { id, pair, flagged: key, match: other, ip: !!m.ip, dev: !!m.dev, event,
-        firstAt: now, lastAt: now, count: 1, status: 'open', posted: {} };
+      a = db.alerts[id] = { id, pairs: [pair], flagged: key, matches: { [other]: { ip: !!m.ip, dev: !!m.dev } }, event,
+        firstAt: now, lastAt: now, count: 1, status: 'open', rev: 1, posted: {} };
+      sumUp(a);
       made.push(id);
+    }
+    // Seen again: count it once per visit, and let the bots update their message.
+    for (const a of touched) {
+      if (made.includes(a.id)) continue;
+      a.lastAt = now; a.count = (a.count || 1) + 1;
+      if (a.status === 'open') a.rev = (a.rev || 0) + 1;
+      sumUp(a);
     }
     save();
     return made;
+  }
+  // a.ip / a.dev / a.match: a summary of all matches (for the bot's embed).
+  function sumUp(a) {
+    const ms = Object.values(a.matches || {});
+    a.ip = ms.some(x => x.ip); a.dev = ms.some(x => x.dev);
+    a.match = Object.keys(a.matches || {})[0] || null;
   }
   // When a pending sign-up (d:<id>) finishes, nothing to rename: accounts are keyed by Discord.
 
@@ -129,22 +166,25 @@ module.exports = function makeAlts(DATA_DIR) {
   }
 
   // ── For the bots (X-Admin-Key) ──
-  // Alerts this league's bot hasn't posted yet.
+  // Alerts this league's bot hasn't posted yet, or that changed since (the bot edits its message).
   function queue(league) {
-    return Object.values(db.alerts).filter(a => a.status === 'open' && !(a.posted || {})[league]);
+    return Object.values(db.alerts).filter(a => {
+      const p = (a.posted || {})[league];
+      return a.status === 'open' ? (!p || (p.rev || 0) < (a.rev || 0)) : false;
+    });
   }
   function ack(id, league, info) {
     const a = db.alerts[id]; if (!a) return false;
-    a.posted = Object.assign({}, a.posted, { [league]: info || { at: Date.now() } });
+    a.posted = Object.assign({}, a.posted, { [league]: Object.assign({}, info, { rev: info && info.rev != null ? info.rev : (a.rev || 0) }) });
     save(); return true;
   }
-  // decision: 'alt' (confirmed) or 'not' (never flag this pair again).
+  // decision: 'alt' (confirmed) or 'not' (never flag these accounts together again).
   function decide(id, decision, by) {
     const a = db.alerts[id]; if (!a) return null;
     if (a.status !== 'open') return a;
     a.status = decision === 'alt' ? 'alt' : 'not';
     a.decidedBy = by || null; a.decidedAt = Date.now();
-    if (a.status === 'not') db.ignore[a.pair] = Date.now();
+    if (a.status === 'not') for (const pr of a.pairs || []) db.ignore[pr] = Date.now();
     save(); return a;
   }
   const get = id => db.alerts[id] || null;
