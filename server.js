@@ -704,7 +704,7 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/alts/queue' && req.method === 'GET') return send(res, 200, alts.queue(String(url.searchParams.get('league') || 'pba')));
       const body = req.method === 'POST' ? (await readBody(req)) || {} : {};
       if (url.pathname === '/alts/ack' && req.method === 'POST')
-        return alts.ack(String(body.id), String(body.league || 'pba'), { channelId: body.channelId || null, messageId: body.messageId || null, at: Date.now() })
+        return alts.ack(String(body.id), String(body.league || 'pba'), { channelId: body.channelId || null, messageId: body.messageId || null, rev: Number(body.rev) || 0, at: Date.now() })
           ? send(res, 200, { ok: true }) : send(res, 404, { error: 'Alert not found' });
       if (url.pathname === '/alts/decide' && req.method === 'POST') {
         const a = alts.decide(String(body.id), body.decision === 'alt' ? 'alt' : 'not', body.by ? String(body.by) : null);
