@@ -38,6 +38,8 @@ const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
 
 // ─────────────────────────── storage ───────────────────────────
 fs.mkdirSync(DATA_DIR, { recursive: true });
+// Alt detection (alts.js): hashed networks/devices, VPN check and staff alerts, kept in alts.json.
+const alts = require('./alts')(DATA_DIR);
 let root = null;
 try {
   if (fs.existsSync(DB_FILE)) root = clean(JSON.parse(fs.readFileSync(DB_FILE, 'utf8')));
@@ -356,7 +358,69 @@ function setDiscord(robloxId, d) {
   scheduleSave();
 }
 
+// ── Sign-up (Discord first) ──
+// Step 3 links Discord (/auth/signup/discord), step 4 is the alt/VPN check (/auth/signup/check),
+// step 5 links Roblox (/auth/roblox/start?signup=…). A Discord that already has an account signs
+// straight in. Pending sign-ups live in memory for 30 minutes.
+const signups = new Map();   // sha(token) -> { discord, checked, device, exp }
+const altKey = acct => acct && acct.discordId ? 'd:' + acct.discordId : acct && acct.robloxId ? 'r:' + acct.robloxId : null;
+function discordFields(d) {
+  const avatar = d.avatar
+    ? `https://cdn.discordapp.com/avatars/${d.id}/${d.avatar}.${String(d.avatar).startsWith('a_') ? 'gif' : 'png'}?size=256`
+    : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(d.id) >> 22n) % 6}.png`;
+  return { discordId: String(d.id), discordUsername: d.username || '', discordGlobalName: d.global_name || '', discordAvatar: avatar, discordLinkedAt: Date.now() };
+}
+async function discordUser(dtoken) {
+  const r = await fetch('https://discord.com/api/users/@me', { headers: { Authorization: 'Bearer ' + dtoken }, signal: AbortSignal.timeout(8000) });
+  if (!r.ok) return null;
+  const d = await r.json();
+  return d && /^\d+$/.test(String(d.id || '')) ? d : null;
+}
+function newSession(robloxId) {
+  const token = b64url(crypto.randomBytes(32));
+  sessions[crypto.createHash('sha256').update(token).digest('hex')] = { robloxId, exp: Date.now() + SESSION_DAYS * 86400000 };
+  saveSessions();
+  return token;
+}
+const signupOf = t => { const s = t && signups.get(crypto.createHash('sha256').update(String(t)).digest('hex')); return s && s.exp >= Date.now() ? s : null; };
+const VPN_MSG = 'It looks like you\'re using a VPN or proxy. Turn it off, then try again.';
+
 async function handleAuth(req, res, url) {
+  // Sign-up step 3: Discord. Existing account → signed in. New → a sign-up token for steps 4 and 5.
+  if (url.pathname === '/auth/signup/discord' && req.method === 'POST') {
+    let body; try { body = await readBody(req); } catch { return send(res, 400, { error: 'Bad request' }); }
+    const dtoken = body && String(body.discordToken || '');
+    if (!dtoken) return send(res, 400, { error: 'Missing Discord token' });
+    let d; try { d = await discordUser(dtoken); } catch { return send(res, 503, { error: 'Could not reach Discord, please try again' }); }
+    if (!d) return send(res, 400, { error: 'Discord sign-in expired, please try again' });
+    const device = alts.okDevice(body.device) ? body.device : null;
+    const accts = getAt(root, ['accounts']) || {};
+    const rid = Object.keys(accts).find(k => String((accts[k] || {}).discordId || '') === String(d.id));
+    if (rid) {
+      // Returning player: sign in with Discord.
+      root = setAt(root, ['accounts', rid, 'lastLogin'], Date.now()); scheduleSave();
+      alts.record('d:' + d.id, alts.clientIp(req), device, 'signin');
+      return send(res, 200, { session: newSession(rid), user: publicUser(getAt(root, ['accounts', rid])) });
+    }
+    const token = b64url(crypto.randomBytes(24));
+    signups.set(crypto.createHash('sha256').update(token).digest('hex'), { discord: discordFields(d), device, checked: false, exp: Date.now() + 30 * 60 * 1000 });
+    for (const [k, v] of signups) if (v.exp < Date.now()) signups.delete(k);
+    const f = discordFields(d);
+    return send(res, 200, { signup: token, discord: { username: f.discordUsername, globalName: f.discordGlobalName, avatar: f.discordAvatar } });
+  }
+  // Sign-up step 4: alt detection. Refuses VPNs; flags shared networks/devices for staff (never shown here).
+  if (url.pathname === '/auth/signup/check' && req.method === 'POST') {
+    let body; try { body = await readBody(req); } catch { return send(res, 400, { error: 'Bad request' }); }
+    const su = signupOf(body && body.signup);
+    if (!su) return send(res, 401, { error: 'Your sign-up expired. Link Discord again.', expired: true });
+    const ip = alts.clientIp(req);
+    if ((await alts.vpnCheck(ip)).vpn) return send(res, 403, { error: VPN_MSG, vpn: true });
+    if (alts.okDevice(body.device)) su.device = body.device;
+    alts.record('d:' + su.discord.discordId, ip, su.device, 'signup');
+    su.checked = true;
+    return send(res, 200, { ok: true });
+  }
+
   // 1) Send the player to Roblox's login / authorize page.
   if (url.pathname === '/auth/roblox/start' && req.method === 'GET') {
     const returnTo = safeReturn(url.searchParams.get('return') || '');
@@ -375,7 +439,9 @@ async function handleAuth(req, res, url) {
     const verifier = b64url(crypto.randomBytes(32));
     const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
     const relink = (url.searchParams.get('relink') || '').slice(0, 100);
-    pendingLogins.set(state, { verifier, returnTo, legalVersion, relink, exp: Date.now() + 10 * 60 * 1000 });
+    const signup = (url.searchParams.get('signup') || '').slice(0, 100);
+    const device = alts.okDevice(url.searchParams.get('device')) ? url.searchParams.get('device') : null;
+    pendingLogins.set(state, { verifier, returnTo, legalVersion, relink, signup, device, exp: Date.now() + 10 * 60 * 1000 });
     for (const [k, v] of pendingLogins) if (v.exp < Date.now()) pendingLogins.delete(k);
     const q = new URLSearchParams({
       client_id: ROBLOX_CLIENT_ID,
@@ -430,6 +496,19 @@ async function handleAuth(req, res, url) {
 
       // Save / update the player's public account record.
       const prev = getAt(root, ['accounts', robloxId]) || {};
+      // Sign-up step 5 (Discord already linked in step 3, alt check passed in step 4).
+      const su = pending.signup ? signupOf(pending.signup) : null;
+      if (pending.signup && (!su || !su.checked)) return fail('Your sign-up expired. Start again from Link Discord.');
+      if (!su && !prev.robloxId) return fail('New here? Start by linking your Discord account.');
+      if (su && prev.discordId && String(prev.discordId) !== su.discord.discordId)
+        return fail('That Roblox account is already linked to a different Discord account. Sign in with that Discord instead.');
+      if (su) {
+        const accts = getAt(root, ['accounts']) || {};
+        if (Object.keys(accts).some(k => k !== robloxId && String((accts[k] || {}).discordId || '') === su.discord.discordId))
+          return fail('That Discord account is already linked to another player.');
+      }
+      const ip = alts.clientIp(req);
+      if (!prev.robloxId && (await alts.vpnCheck(ip)).vpn) return fail(VPN_MSG);   // new accounts only
       // Signing in refreshes the Roblox name/avatar only for new accounts or when a sync is due,
       // so signing out and back in can't be used to skip the 24-hour sync cooldown.
       const fresh = !prev.robloxId || !prev.lastSyncAt || Date.now() - prev.lastSyncAt >= SYNC_COOLDOWN_MS;
@@ -445,6 +524,7 @@ async function handleAuth(req, res, url) {
         acceptedTermsAt: Date.now(),
       };
       DISCORD_FIELDS.forEach(f => { if (prev[f] != null) rec[f] = prev[f]; });
+      if (su && !prev.discordId) Object.assign(rec, su.discord);   // the Discord from step 3
       // Linking a new Roblox account after unlinking: move the existing player profile over
       // instead of creating a second one (avoids a stale duplicate under the old name).
       let relinked = false;
@@ -455,12 +535,15 @@ async function handleAuth(req, res, url) {
       }
       root = setAt(root, ['accounts', robloxId], rec);
       ensurePlayerRecord(rec);
+      if (su) {
+        setDiscord(robloxId, su.discord);   // also puts it on the player profiles
+        signups.delete(crypto.createHash('sha256').update(pending.signup).digest('hex'));
+      }
       scheduleSave();
+      alts.record(altKey(rec), ip, pending.device || (su && su.device), su && !prev.robloxId ? 'signup' : 'signin');
 
-      const token = b64url(crypto.randomBytes(32));
-      sessions[crypto.createHash('sha256').update(token).digest('hex')] = { robloxId, exp: Date.now() + SESSION_DAYS * 86400000 };
-      saveSessions();
-      return redirect(res, pending.returnTo + '#pba_session=' + token + (relinked ? '&pba_relinked=1' : ''));
+      const token = newSession(robloxId);
+      return redirect(res, pending.returnTo + '#pba_session=' + token + (relinked ? '&pba_relinked=1' : '') + (su ? '&pba_new=1' : ''));
     } catch (e) {
       console.error('Roblox sign-in error:', e.message);
       return fail('Could not reach Roblox, please try again');
@@ -571,6 +654,7 @@ async function handleAuth(req, res, url) {
     if (!sess || sess.exp < Date.now()) return send(res, 401, { error: 'Not signed in' });
     const rec = getAt(root, ['accounts', sess.robloxId]);
     if (!rec) return send(res, 401, { error: 'Account not found' });
+    alts.record(altKey(rec), alts.clientIp(req), String(req.headers['x-pba-device'] || ''), 'visit');   // at most once an hour
     return send(res, 200, publicUser(rec));
   }
 
@@ -584,7 +668,7 @@ function cors(req, res) {
   if (allow) res.setHeader('Access-Control-Allow-Origin', allow);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,PATCH,POST,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Firebase-ETag,If-Match,X-Admin-Key');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Firebase-ETag,If-Match,X-Admin-Key,X-PBA-Device');
   res.setHeader('Access-Control-Expose-Headers', 'ETag');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
@@ -612,6 +696,23 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/' || url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('PBA data server OK');
+  }
+  // Alt alerts for the Discord bots (admin key only): queue, ack (posted), decide (Confirm Alt / Not an Alt).
+  if (url.pathname.startsWith('/alts/')) {
+    if (!ADMIN_KEY || req.headers['x-admin-key'] !== ADMIN_KEY) return send(res, 403, { error: 'Admin key required' });
+    try {
+      if (url.pathname === '/alts/queue' && req.method === 'GET') return send(res, 200, alts.queue(String(url.searchParams.get('league') || 'pba')));
+      const body = req.method === 'POST' ? (await readBody(req)) || {} : {};
+      if (url.pathname === '/alts/ack' && req.method === 'POST')
+        return alts.ack(String(body.id), String(body.league || 'pba'), { channelId: body.channelId || null, messageId: body.messageId || null, at: Date.now() })
+          ? send(res, 200, { ok: true }) : send(res, 404, { error: 'Alert not found' });
+      if (url.pathname === '/alts/decide' && req.method === 'POST') {
+        const a = alts.decide(String(body.id), body.decision === 'alt' ? 'alt' : 'not', body.by ? String(body.by) : null);
+        return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' });
+      }
+      if (url.pathname === '/alts/get' && req.method === 'GET') { const a = alts.get(String(url.searchParams.get('id'))); return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' }); }
+    } catch (e) { console.error(e); return send(res, 500, { error: 'Server error' }); }
+    return send(res, 404, { error: 'Not found' });
   }
   if (url.pathname.startsWith('/auth/')) {
     try { return await handleAuth(req, res, url); }
