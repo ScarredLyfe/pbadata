@@ -188,6 +188,16 @@ module.exports = function makeAlts(DATA_DIR) {
     save(); return a;
   }
   const get = id => db.alerts[id] || null;
+  // Is this player in any alert? keys: ['d:<discordId>', 'r:<robloxId>'].
+  // Alerts marked "Not an Alt" don't count. Returns the matching alerts, confirmed ones first.
+  function check(keys) {
+    const ks = new Set((keys || []).filter(Boolean));
+    const list = Object.values(db.alerts).filter(a => a.status !== 'not' &&
+      (ks.has(a.flagged) || Object.keys(a.matches || {}).some(k => ks.has(k))));
+    list.sort((x, y) => (y.status === 'alt') - (x.status === 'alt') || y.lastAt - x.lastAt);
+    return list.map(a => ({ id: a.id, status: a.status, ip: !!a.ip, dev: !!a.dev, lastAt: a.lastAt, posted: a.posted || {},
+      others: [a.flagged, ...Object.keys(a.matches || {})].filter(k => !ks.has(k)) }));
+  }
 
-  return { record, vpnCheck, clientIp, okDevice, queue, ack, decide, get };
+  return { record, vpnCheck, clientIp, okDevice, queue, ack, decide, get, check };
 };
