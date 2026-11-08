@@ -408,7 +408,10 @@ async function handleAuth(req, res, url) {
     } else {
       const spots = ['PG', 'SG', 'SF', 'PF', 'C'];
       const part = o => { const out = {}; for (const k of spots) { const v = id_(o && o[k]); if (v) out[k] = v; } return out; };
-      reqRec.lineup = { starters: part(body.lineup && body.lineup.starters), bench: part(body.lineup && body.lineup.bench) };
+      // Bench: a list of { player, pos } (as many spots as the roster has players beyond the 5 starters).
+      const benchIn = Array.isArray(body.lineup && body.lineup.bench) ? body.lineup.bench.slice(0, 20) : [];
+      const bench = benchIn.map(b => ({ player: id_(b && b.player), pos: spots.includes(b && b.pos) ? b.pos : null })).filter(b => b.player);
+      reqRec.lineup = { starters: part(body.lineup && body.lineup.starters), bench };
     }
     // At most 5 waiting requests per person (stops spam).
     const waiting = Object.values(getAt(root, [...B, 'bot', 'teamreq']) || {}).filter(x => x && x.by === reqRec.by && x.status === 'pending').length;
