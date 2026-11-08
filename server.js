@@ -143,7 +143,7 @@ async function discordIdFromToken(token) {
 // data/adminAccess/<discordId> = { name, sections: ['teams','stats',...] }
 // Super admins (SUPER_ADMIN_DISCORD_IDS, or a legacy role:'super') can do everything,
 // including managing access. Older role:'regular' records keep what they had before.
-const ALL_SECTIONS = ['teams', 'stats', 'schedule', 'seasons', 'bracket', 'accolades'];
+const ALL_SECTIONS = ['teams', 'stats', 'schedule', 'seasons', 'bracket', 'accolades', 'applications'];
 // Two leagues share this server. PBA lives at the top of the database (as before); PBCA lives under
 // leagues/pbca/ with the same layout (data/teams, seasons, schedule, boxscores, …, its own admin list).
 // Roblox/Discord accounts are shared; each league has its own player profiles (team, stats).
@@ -180,6 +180,7 @@ function sectionsForPath(segs) {
   if (a === 'bracket') return ['bracket'];
   if (a === 'accolades' || a === 'awards') return ['accolades'];   // Awards + Player of the Series
   if (a === 'boxscores') return ['stats'];                           // player box scores (Stats & Score)
+  if (a === 'applications') return ['applications'];                // staff application forms (the Discord bot's panel)
   return null; // data/adminAccess, data/playerdb, accounts, the root, anything else
 }
 function allowed(perms, segs) {
