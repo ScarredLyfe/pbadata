@@ -386,7 +386,7 @@ const signupOf = t => { const s = t && signups.get(crypto.createHash('sha256').u
 const VPN_MSG = 'It looks like you\'re using a VPN or proxy. Turn it off, then try again.';
 
 async function handleAuth(req, res, url) {
-  // Team Management (the Owner's team card on the website): promote, demote, lineup.
+  // Team card on the website: promote / demote (Owner), release (Owner or coach), lineup (Owner).
   // Saved for that league's Discord bot at <league>/bot/teamreq/<id>; the bot checks in Discord
   // that they really own the team, does it, and writes the result back on the request.
   if (url.pathname === '/auth/team/request' && req.method === 'POST') {
@@ -398,10 +398,10 @@ async function handleAuth(req, res, url) {
     const lg = body.league === 'pbca' ? 'pbca' : 'pba';
     const B = lg === 'pbca' ? ['leagues', 'pbca'] : [];
     const type = String(body.type || '');
-    if (!['promote', 'demote', 'lineup'].includes(type)) return send(res, 400, { error: 'Unknown request' });
+    if (!['promote', 'demote', 'release', 'lineup'].includes(type)) return send(res, 400, { error: 'Unknown request' });
     const id_ = v => (typeof v === 'string' || typeof v === 'number') && /^[\w-]{1,64}$/.test(String(v)) ? String(v) : null;
     const reqRec = { status: 'pending', at: Date.now(), type, by: String(acct.discordId), byRoblox: String(sess.robloxId), teamCode: id_(body.teamCode) };
-    if (type === 'promote' || type === 'demote') {
+    if (type === 'promote' || type === 'demote' || type === 'release') {
       reqRec.target = id_(body.target);
       if (!reqRec.target) return send(res, 400, { error: 'Pick a player.' });
       if (type === 'promote') reqRec.position = ['coach_1', 'coach_2'].includes(body.position) ? body.position : 'coach_1';
