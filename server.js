@@ -386,6 +386,39 @@ const signupOf = t => { const s = t && signups.get(crypto.createHash('sha256').u
 const VPN_MSG = 'It looks like you\'re using a VPN or proxy. Turn it off, then try again.';
 
 async function handleAuth(req, res, url) {
+  // Team Management (the Owner's team card on the website): promote, demote, lineup.
+  // Saved for that league's Discord bot at <league>/bot/teamreq/<id>; the bot checks in Discord
+  // that they really own the team, does it, and writes the result back on the request.
+  if (url.pathname === '/auth/team/request' && req.method === 'POST') {
+    const sess = sessionOf(req);
+    if (!sess) return send(res, 401, { error: 'Sign in first.' });
+    const acct = getAt(root, ['accounts', String(sess.robloxId)]);
+    if (!acct || !acct.discordId) return send(res, 403, { error: 'Link your Discord account first.' });
+    let body; try { body = (await readBody(req)) || {}; } catch { return send(res, 400, { error: 'Bad request' }); }
+    const lg = body.league === 'pbca' ? 'pbca' : 'pba';
+    const B = lg === 'pbca' ? ['leagues', 'pbca'] : [];
+    const type = String(body.type || '');
+    if (!['promote', 'demote', 'lineup'].includes(type)) return send(res, 400, { error: 'Unknown request' });
+    const id_ = v => (typeof v === 'string' || typeof v === 'number') && /^[\w-]{1,64}$/.test(String(v)) ? String(v) : null;
+    const reqRec = { status: 'pending', at: Date.now(), type, by: String(acct.discordId), byRoblox: String(sess.robloxId), teamCode: id_(body.teamCode) };
+    if (type === 'promote' || type === 'demote') {
+      reqRec.target = id_(body.target);
+      if (!reqRec.target) return send(res, 400, { error: 'Pick a player.' });
+      if (type === 'promote') reqRec.position = ['coach_1', 'coach_2'].includes(body.position) ? body.position : 'coach_1';
+    } else {
+      const spots = ['PG', 'SG', 'SF', 'PF', 'C'];
+      const part = o => { const out = {}; for (const k of spots) { const v = id_(o && o[k]); if (v) out[k] = v; } return out; };
+      reqRec.lineup = { starters: part(body.lineup && body.lineup.starters), bench: part(body.lineup && body.lineup.bench) };
+    }
+    // At most 5 waiting requests per person (stops spam).
+    const waiting = Object.values(getAt(root, [...B, 'bot', 'teamreq']) || {}).filter(x => x && x.by === reqRec.by && x.status === 'pending').length;
+    if (waiting >= 5) return send(res, 429, { error: 'Slow down: wait for your last changes to finish.' });
+    const id = pushId();
+    reqRec.id = id;
+    root = setAt(root, [...B, 'bot', 'teamreq', id], reqRec);
+    scheduleSave();
+    return send(res, 200, { id });
+  }
   // Sign-up step 3: Discord. Existing account → signed in. New → a sign-up token for steps 4 and 5.
   if (url.pathname === '/auth/signup/discord' && req.method === 'POST') {
     let body; try { body = await readBody(req); } catch { return send(res, 400, { error: 'Bad request' }); }
