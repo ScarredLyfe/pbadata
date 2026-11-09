@@ -187,17 +187,40 @@ module.exports = function makeAlts(DATA_DIR) {
     if (a.status === 'not') for (const pr of a.pairs || []) db.ignore[pr] = Date.now();
     save(); return a;
   }
+  // Undo a "Confirm Alt" pressed by mistake (/falsealt in Discord): the alert becomes "Not an Alt"
+  // (the accounts won't be flagged together again).
+  function reverse(id, by) {
+    const a = db.alerts[id]; if (!a) return null;
+    if (a.status !== 'alt') return a;
+    a.status = 'not';
+    a.reversedBy = by || null; a.reversedAt = Date.now();
+    a.decidedBy = by || a.decidedBy; a.decidedAt = Date.now();
+    for (const pr of a.pairs || []) db.ignore[pr] = Date.now();
+    save(); return a;
+  }
+  // Undo a "Not an Alt" pressed by mistake (/truealt in Discord): the alert becomes a confirmed alt,
+  // and the accounts can be flagged together again.
+  function confirm(id, by) {
+    const a = db.alerts[id]; if (!a) return null;
+    if (a.status !== 'not') return a;
+    a.status = 'alt';
+    a.confirmedLateBy = by || null; a.confirmedLateAt = Date.now();
+    a.decidedBy = by || a.decidedBy; a.decidedAt = Date.now();
+    for (const pr of a.pairs || []) delete db.ignore[pr];
+    save(); return a;
+  }
   const get = id => db.alerts[id] || null;
   // Is this player in any alert? keys: ['d:<discordId>', 'r:<robloxId>'].
   // Alerts marked "Not an Alt" don't count. Returns the matching alerts, confirmed ones first.
-  function check(keys) {
+  // all = true: include alerts marked "Not an Alt" too (for /truealt).
+  function check(keys, all) {
     const ks = new Set((keys || []).filter(Boolean));
-    const list = Object.values(db.alerts).filter(a => a.status !== 'not' &&
+    const list = Object.values(db.alerts).filter(a => (all || a.status !== 'not') &&
       (ks.has(a.flagged) || Object.keys(a.matches || {}).some(k => ks.has(k))));
     list.sort((x, y) => (y.status === 'alt') - (x.status === 'alt') || y.lastAt - x.lastAt);
     return list.map(a => ({ id: a.id, status: a.status, ip: !!a.ip, dev: !!a.dev, lastAt: a.lastAt, posted: a.posted || {},
       others: [a.flagged, ...Object.keys(a.matches || {})].filter(k => !ks.has(k)) }));
   }
 
-  return { record, vpnCheck, clientIp, okDevice, queue, ack, decide, get, check };
+  return { record, vpnCheck, clientIp, okDevice, queue, ack, decide, reverse, confirm, get, check };
 };
