@@ -362,7 +362,7 @@ function setDiscord(robloxId, d) {
 // Finish a Roblox sign-in / sign-up once we know the Roblox account (from Roblox's sign-in page,
 // or from the backup "code in your About" check). info: { preferred_username, name, picture }.
 // Returns { error } or { token, relinked, su }.
-async function finishRobloxLogin(req, pending, robloxId, info) {
+async function finishRobloxLogin(req, pending, robloxId, info, opts = {}) {
   const E = error => ({ error });
   // Save / update the player's public account record.
   const prev = getAt(root, ['accounts', robloxId]) || {};
@@ -381,7 +381,8 @@ async function finishRobloxLogin(req, pending, robloxId, info) {
   if (!prev.robloxId && (await alts.vpnCheck(ip)).vpn) return E(VPN_MSG);   // new accounts only
   // Signing in refreshes the Roblox name/avatar only for new accounts or when a sync is due,
   // so signing out and back in can't be used to skip the 24-hour sync cooldown.
-  const fresh = !prev.robloxId || !prev.lastSyncAt || Date.now() - prev.lastSyncAt >= SYNC_COOLDOWN_MS;
+  // (opts.fresh: the code-in-About check just read their profile from Roblox, so always use it.)
+  const fresh = opts.fresh || !prev.robloxId || !prev.lastSyncAt || Date.now() - prev.lastSyncAt >= SYNC_COOLDOWN_MS;
   const rec = {
     robloxId,
     username: (fresh && (info.preferred_username || info.nickname)) || prev.username || '',
@@ -568,7 +569,7 @@ async function handleAuth(req, res, url) {
     if (!norm(about).includes(norm(pend.code))) return send(res, 409, { error: 'The code isn\'t in your Roblox About yet. Paste it in, press Save on Roblox, wait a few seconds, then press Verify again. (Roblox sometimes hides text with #####: if that happens, get a new code.)' });
     let prof;
     try { prof = await fetchRobloxProfile(pend.robloxId); } catch { return send(res, 502, { error: 'Could not reach Roblox, please try again.' }); }
-    const r = await finishRobloxLogin(req, pend, pend.robloxId, { preferred_username: prof.username, name: prof.displayName, picture: prof.avatar });
+    const r = await finishRobloxLogin(req, pend, pend.robloxId, { preferred_username: prof.username, name: prof.displayName, picture: prof.avatar }, { fresh: true });
     if (r.error) return send(res, 400, { error: r.error });
     codeLogins.delete(key);
     return send(res, 200, { session: r.token, relinked: !!r.relinked, isNew: !!r.su });
