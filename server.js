@@ -359,11 +359,69 @@ function setDiscord(robloxId, d) {
   scheduleSave();
 }
 
+// Finish a Roblox sign-in / sign-up once we know the Roblox account (from Roblox's sign-in page,
+// or from the backup "code in your About" check). info: { preferred_username, name, picture }.
+// Returns { error } or { token, relinked, su }.
+async function finishRobloxLogin(req, pending, robloxId, info) {
+  const E = error => ({ error });
+  // Save / update the player's public account record.
+  const prev = getAt(root, ['accounts', robloxId]) || {};
+  // Sign-up step 5 (Discord already linked in step 3, alt check passed in step 4).
+  const su = pending.signup ? signupOf(pending.signup) : null;
+  if (pending.signup && (!su || !su.checked)) return E('Your sign-up expired. Start again from Link Discord.');
+  if (!su && !prev.robloxId) return E('New here? Start by linking your Discord account.');
+  if (su && prev.discordId && String(prev.discordId) !== su.discord.discordId)
+    return E('That Roblox account is already linked to a different Discord account. Sign in with that Discord instead.');
+  if (su) {
+    const accts = getAt(root, ['accounts']) || {};
+    if (Object.keys(accts).some(k => k !== robloxId && String((accts[k] || {}).discordId || '') === su.discord.discordId))
+      return E('That Discord account is already linked to another player.');
+  }
+  const ip = alts.clientIp(req);
+  if (!prev.robloxId && (await alts.vpnCheck(ip)).vpn) return E(VPN_MSG);   // new accounts only
+  // Signing in refreshes the Roblox name/avatar only for new accounts or when a sync is due,
+  // so signing out and back in can't be used to skip the 24-hour sync cooldown.
+  const fresh = !prev.robloxId || !prev.lastSyncAt || Date.now() - prev.lastSyncAt >= SYNC_COOLDOWN_MS;
+  const rec = {
+    robloxId,
+    username: (fresh && (info.preferred_username || info.nickname)) || prev.username || '',
+    displayName: (fresh && (info.name || info.nickname)) || prev.displayName || '',
+    avatar: (fresh && info.picture) || prev.avatar || '',
+    lastSyncAt: fresh ? Date.now() : prev.lastSyncAt,
+    createdAt: prev.createdAt || Date.now(),
+    lastLogin: Date.now(),
+    acceptedTermsVersion: pending.legalVersion,
+    acceptedTermsAt: Date.now(),
+  };
+  DISCORD_FIELDS.forEach(f => { if (prev[f] != null) rec[f] = prev[f]; });
+  if (su && !prev.discordId) Object.assign(rec, su.discord);   // the Discord from step 3
+  // Linking a new Roblox account after unlinking: move the existing player profile over
+  // instead of creating a second one (avoids a stale duplicate under the old name).
+  let relinked = false;
+  if (pending.relink) {
+    const r = relinkPlayer(pending.relink, rec);
+    if (r.error) return E(r.error);
+    relinked = r.ok;
+  }
+  root = setAt(root, ['accounts', robloxId], rec);
+  ensurePlayerRecord(rec);
+  if (su) {
+    setDiscord(robloxId, su.discord);   // also puts it on the player profiles
+    signups.delete(crypto.createHash('sha256').update(pending.signup).digest('hex'));
+  }
+  scheduleSave();
+  alts.record(altKey(rec), ip, pending.device || (su && su.device), su && !prev.robloxId ? 'signup' : 'signin');
+
+  const token = newSession(robloxId);
+  return { token, relinked, su };
+}
+
 // ── Sign-up (Discord first) ──
 // Step 3 links Discord (/auth/signup/discord), step 4 is the alt/VPN check (/auth/signup/check),
 // step 5 links Roblox (/auth/roblox/start?signup=…). A Discord that already has an account signs
 // straight in. Pending sign-ups live in memory for 30 minutes.
 const signups = new Map();   // sha(token) -> { discord, checked, device, exp }
+const codeLogins = new Map();   // sha(token) -> { robloxId, code, signup, relink, legalVersion, device, tries, exp } (backup Roblox link)
 const altKey = acct => acct && acct.discordId ? 'd:' + acct.discordId : acct && acct.robloxId ? 'r:' + acct.robloxId : null;
 function discordFields(d) {
   const avatar = d.avatar
@@ -458,6 +516,64 @@ async function handleAuth(req, res, url) {
     return send(res, 200, { ok: true });
   }
 
+  // Backup way to link Roblox, for players Roblox won't let use its sign-in page (under-13 accounts,
+  // or a country's minimum age): put a code from the site in your Roblox profile's About, then
+  // press Verify. Only the account's owner can edit its About, so that proves it's theirs.
+  //   POST /auth/roblox/code/start { username, signup, relink, agree, v, device } → { token, code, user }
+  //   POST /auth/roblox/code/check { token } → { session, relinked, isNew } once the code is in the About.
+  if (url.pathname === '/auth/roblox/code/start' && req.method === 'POST') {
+    let body; try { body = await readBody(req); } catch { return send(res, 400, { error: 'Bad request' }); }
+    const username = String((body && body.username) || '').trim().replace(/^@/, '');
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return send(res, 400, { error: 'Enter a valid Roblox username.' });
+    const agreed = String(body.agree || '').split(',');
+    const legalVersion = String(body.v || '').slice(0, 20);
+    if (!agreed.includes('terms') || !agreed.includes('privacy') || !legalVersion) return send(res, 400, { error: 'Please accept the Terms of Use and Privacy Policy first.' });
+    const signup = String(body.signup || '').slice(0, 100);
+    const su = signup ? signupOf(signup) : null;
+    if (signup && (!su || !su.checked)) return send(res, 401, { error: 'Your sign-up expired. Start again from Link Discord.', expired: true });
+    let user;
+    try {
+      const r = await fetch('https://users.roblox.com/v1/usernames/users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usernames: [username], excludeBannedUsers: true }), signal: AbortSignal.timeout(8000) });
+      const j = r.ok ? await r.json() : null;
+      user = j && j.data && j.data[0];
+    } catch { return send(res, 502, { error: 'Could not reach Roblox, please try again.' }); }
+    if (!user || !user.id) return send(res, 404, { error: 'No Roblox account has that username.' });
+    // Words only: Roblox's filter often hides numbers in an About with ####.
+    const words = ['hoop', 'dunk', 'court', 'rim', 'swish', 'assist', 'rebound', 'layup', 'buzzer', 'jumper', 'crossover', 'baseline',
+      'paint', 'arena', 'bench', 'tipoff', 'dribble', 'pivot', 'screen', 'triple', 'block', 'steal', 'pass', 'net'];
+    const pick = () => words[crypto.randomInt(words.length)];
+    const code = `${pick()} ${pick()} ${pick()} ${pick()} ${pick()}`;
+    const token = b64url(crypto.randomBytes(24));
+    codeLogins.set(crypto.createHash('sha256').update(token).digest('hex'), {
+      robloxId: String(user.id), code, legalVersion, signup, relink: String(body.relink || '').slice(0, 100),
+      device: alts.okDevice(body.device) ? body.device : null, tries: 0, exp: Date.now() + 20 * 60 * 1000,
+    });
+    for (const [k, v] of codeLogins) if (v.exp < Date.now()) codeLogins.delete(k);
+    return send(res, 200, { token, code, user: { id: String(user.id), username: user.name, displayName: user.displayName || user.name } });
+  }
+  if (url.pathname === '/auth/roblox/code/check' && req.method === 'POST') {
+    let body; try { body = await readBody(req); } catch { return send(res, 400, { error: 'Bad request' }); }
+    const key = crypto.createHash('sha256').update(String((body && body.token) || '')).digest('hex');
+    const pend = codeLogins.get(key);
+    if (!pend || pend.exp < Date.now()) { codeLogins.delete(key); return send(res, 410, { error: 'This code expired. Get a new one.', expired: true }); }
+    if (++pend.tries > 30) { codeLogins.delete(key); return send(res, 429, { error: 'Too many tries. Get a new code.', expired: true }); }
+    let about = '';
+    try {
+      const r = await fetch('https://users.roblox.com/v1/users/' + encodeURIComponent(pend.robloxId), { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) throw new Error(String(r.status));
+      about = String((await r.json()).description || '');
+    } catch { return send(res, 502, { error: 'Could not reach Roblox, please try again.' }); }
+    const norm = t => t.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!norm(about).includes(norm(pend.code))) return send(res, 409, { error: 'The code isn\'t in your Roblox About yet. Paste it in, press Save on Roblox, wait a few seconds, then press Verify again. (Roblox sometimes hides text with #####: if that happens, get a new code.)' });
+    let prof;
+    try { prof = await fetchRobloxProfile(pend.robloxId); } catch { return send(res, 502, { error: 'Could not reach Roblox, please try again.' }); }
+    const r = await finishRobloxLogin(req, pend, pend.robloxId, { preferred_username: prof.username, name: prof.displayName, picture: prof.avatar });
+    if (r.error) return send(res, 400, { error: r.error });
+    codeLogins.delete(key);
+    return send(res, 200, { session: r.token, relinked: !!r.relinked, isNew: !!r.su });
+  }
+
   // 1) Send the player to Roblox's login / authorize page.
   if (url.pathname === '/auth/roblox/start' && req.method === 'GET') {
     const returnTo = safeReturn(url.searchParams.get('return') || '');
@@ -531,56 +647,9 @@ async function handleAuth(req, res, url) {
       const robloxId = String(info.sub || '');
       if (!/^\d+$/.test(robloxId)) return fail('Roblox returned an invalid account');
 
-      // Save / update the player's public account record.
-      const prev = getAt(root, ['accounts', robloxId]) || {};
-      // Sign-up step 5 (Discord already linked in step 3, alt check passed in step 4).
-      const su = pending.signup ? signupOf(pending.signup) : null;
-      if (pending.signup && (!su || !su.checked)) return fail('Your sign-up expired. Start again from Link Discord.');
-      if (!su && !prev.robloxId) return fail('New here? Start by linking your Discord account.');
-      if (su && prev.discordId && String(prev.discordId) !== su.discord.discordId)
-        return fail('That Roblox account is already linked to a different Discord account. Sign in with that Discord instead.');
-      if (su) {
-        const accts = getAt(root, ['accounts']) || {};
-        if (Object.keys(accts).some(k => k !== robloxId && String((accts[k] || {}).discordId || '') === su.discord.discordId))
-          return fail('That Discord account is already linked to another player.');
-      }
-      const ip = alts.clientIp(req);
-      if (!prev.robloxId && (await alts.vpnCheck(ip)).vpn) return fail(VPN_MSG);   // new accounts only
-      // Signing in refreshes the Roblox name/avatar only for new accounts or when a sync is due,
-      // so signing out and back in can't be used to skip the 24-hour sync cooldown.
-      const fresh = !prev.robloxId || !prev.lastSyncAt || Date.now() - prev.lastSyncAt >= SYNC_COOLDOWN_MS;
-      const rec = {
-        robloxId,
-        username: (fresh && (info.preferred_username || info.nickname)) || prev.username || '',
-        displayName: (fresh && (info.name || info.nickname)) || prev.displayName || '',
-        avatar: (fresh && info.picture) || prev.avatar || '',
-        lastSyncAt: fresh ? Date.now() : prev.lastSyncAt,
-        createdAt: prev.createdAt || Date.now(),
-        lastLogin: Date.now(),
-        acceptedTermsVersion: pending.legalVersion,
-        acceptedTermsAt: Date.now(),
-      };
-      DISCORD_FIELDS.forEach(f => { if (prev[f] != null) rec[f] = prev[f]; });
-      if (su && !prev.discordId) Object.assign(rec, su.discord);   // the Discord from step 3
-      // Linking a new Roblox account after unlinking: move the existing player profile over
-      // instead of creating a second one (avoids a stale duplicate under the old name).
-      let relinked = false;
-      if (pending.relink) {
-        const r = relinkPlayer(pending.relink, rec);
-        if (r.error) return fail(r.error);
-        relinked = r.ok;
-      }
-      root = setAt(root, ['accounts', robloxId], rec);
-      ensurePlayerRecord(rec);
-      if (su) {
-        setDiscord(robloxId, su.discord);   // also puts it on the player profiles
-        signups.delete(crypto.createHash('sha256').update(pending.signup).digest('hex'));
-      }
-      scheduleSave();
-      alts.record(altKey(rec), ip, pending.device || (su && su.device), su && !prev.robloxId ? 'signup' : 'signin');
-
-      const token = newSession(robloxId);
-      return redirect(res, pending.returnTo + '#pba_session=' + token + (relinked ? '&pba_relinked=1' : '') + (su ? '&pba_new=1' : ''));
+      const r = await finishRobloxLogin(req, pending, robloxId, info);
+      if (r.error) return fail(r.error);
+      return redirect(res, pending.returnTo + '#pba_session=' + r.token + (r.relinked ? '&pba_relinked=1' : '') + (r.su ? '&pba_new=1' : ''));
     } catch (e) {
       console.error('Roblox sign-in error:', e.message);
       return fail('Could not reach Roblox, please try again');
