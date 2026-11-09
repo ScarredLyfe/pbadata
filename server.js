@@ -747,8 +747,16 @@ const server = http.createServer(async (req, res) => {
         const a = alts.decide(String(body.id), body.decision === 'alt' ? 'alt' : 'not', body.by ? String(body.by) : null);
         return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' });
       }
+      if (url.pathname === '/alts/confirm' && req.method === 'POST') {
+        const a = alts.confirm(String(body.id), body.by ? String(body.by) : null);
+        return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' });
+      }
+      if (url.pathname === '/alts/reverse' && req.method === 'POST') {
+        const a = alts.reverse(String(body.id), body.by ? String(body.by) : null);
+        return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' });
+      }
       if (url.pathname === '/alts/check' && req.method === 'GET')
-        return send(res, 200, alts.check(String(url.searchParams.get('keys') || '').split(',').map(k => k.trim()).filter(Boolean)));
+        return send(res, 200, alts.check(String(url.searchParams.get('keys') || '').split(',').map(k => k.trim()).filter(Boolean), url.searchParams.get('all') === '1'));
       if (url.pathname === '/alts/get' && req.method === 'GET') { const a = alts.get(String(url.searchParams.get('id'))); return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' }); }
     } catch (e) { console.error(e); return send(res, 500, { error: 'Server error' }); }
     return send(res, 404, { error: 'Not found' });
