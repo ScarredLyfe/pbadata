@@ -7,7 +7,8 @@
 //  • Two accounts on the same network or device → an alert for staff (the bots post it in the
 //    Alt Logs channel). A network shared by more than 5 accounts (school, phone carrier) is ignored.
 //  • VPN check (proxycheck.io) for new sign-ups: known VPNs/proxies are refused. Apple's iCloud
-//    Private Relay is let through.
+//    Private Relay is let through. Staff can let one person past it with /vpn_allow in Discord
+//    (vpnAllow, by Discord ID), e.g. when their home network is wrongly flagged.
 // Everything lives in its own file (alts.json), NOT in db.json, which anyone can read.
 const fs = require('fs');
 const path = require('path');
@@ -29,7 +30,7 @@ module.exports = function makeAlts(DATA_DIR) {
   }
   const hash = (kind, v) => crypto.createHmac('sha256', secret).update(kind + ':' + v).digest('hex').slice(0, 32);
 
-  let db = { ip: {}, dev: {}, alerts: {}, ignore: {}, seen: {} };
+  let db = { ip: {}, dev: {}, alerts: {}, ignore: {}, seen: {}, vpnAllow: {} };
   try { if (fs.existsSync(FILE)) db = Object.assign(db, JSON.parse(fs.readFileSync(FILE, 'utf8')) || {}); } catch (e) { console.error('alts.json unreadable:', e.message); }
   // Older alerts (one account pair each) → the new shape.
   for (const a of Object.values(db.alerts)) {
@@ -210,6 +211,14 @@ module.exports = function makeAlts(DATA_DIR) {
     save(); return a;
   }
   const get = id => db.alerts[id] || null;
+  // /vpn_allow: this Discord account can sign up even if the VPN check flags their network.
+  function allowVpn(discordId, on, by) {
+    const id = String(discordId || '').trim(); if (!/^\d{5,25}$/.test(id)) return null;
+    if (!db.vpnAllow) db.vpnAllow = {};
+    if (on) db.vpnAllow[id] = { by: by || null, at: Date.now() }; else delete db.vpnAllow[id];
+    save(); return { discordId: id, allowed: !!on };
+  }
+  const vpnAllowed = discordId => !!(discordId && db.vpnAllow && db.vpnAllow[String(discordId)]);
   // Is this player in any alert? keys: ['d:<discordId>', 'r:<robloxId>'].
   // Alerts marked "Not an Alt" don't count. Returns the matching alerts, confirmed ones first.
   // all = true: include alerts marked "Not an Alt" too (for /truealt).
@@ -222,5 +231,5 @@ module.exports = function makeAlts(DATA_DIR) {
       others: [a.flagged, ...Object.keys(a.matches || {})].filter(k => !ks.has(k)) }));
   }
 
-  return { record, vpnCheck, clientIp, okDevice, queue, ack, decide, reverse, confirm, get, check };
+  return { allowVpn, vpnAllowed, record, vpnCheck, clientIp, okDevice, queue, ack, decide, reverse, confirm, get, check };
 };
