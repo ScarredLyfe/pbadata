@@ -822,6 +822,12 @@ const server = http.createServer(async (req, res) => {
         const a = alts.confirm(String(body.id), body.by ? String(body.by) : null);
         return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' });
       }
+      // /delete_account in Discord: { discordId, robloxId, action: 'signout' | 'delete' }
+      if (url.pathname === '/alts/privacy' && req.method === 'POST') {
+        const out = privacyRequest({ discordId: body.discordId, robloxId: body.robloxId }, body.action === 'delete' ? 'delete' : 'signout');
+        if (out) console.log(`[privacy] ${out.action} for roblox ${out.robloxId || '?'} (sessions ended: ${out.sessionsEnded})`);
+        return out ? send(res, 200, out) : send(res, 404, { error: 'No website account found for that person' });
+      }
       // /vpn_allow in Discord: { discordId, allow: true|false, by }
       if (url.pathname === '/alts/vpnallow' && req.method === 'POST') {
         const a = alts.allowVpn(body.discordId, body.allow !== false, body.by ? String(body.by) : null);
@@ -939,6 +945,56 @@ function ensurePlayerRecordIn(B, rec) {
     root = setAt(root, [...B, 'data', 'playerdb', key, 'name'], name);
     root = setAt(root, [...B, 'data', 'playerdb', key, 'username'], rec.username);
   }
+}
+
+// Privacy requests (/delete_account in Discord, admin key only).
+//  • 'signout': ends every sign-in session for that player (they have to sign in again).
+//  • 'delete':  deletes the account: every session, the account record, their alt-check records and
+//    VPN allowance. Their league history (box scores, awards) is kept, as the privacy policy says,
+//    but with their name, Roblox and Discord details removed: it shows as "Deleted Player".
+// who = { discordId, robloxId } (either). Returns a summary, or null if no such player.
+function privacyRequest(who, action) {
+  const did = who.discordId ? String(who.discordId) : '', accts = getAt(root, ['accounts']) || {};
+  let rid = who.robloxId ? String(who.robloxId) : '';
+  if (!rid && did) rid = Object.keys(accts).find(k => String((accts[k] || {}).discordId || '') === did) || '';
+  const acct = rid ? accts[rid] : null;
+  const discordId = did || (acct && acct.discordId ? String(acct.discordId) : '');
+  // Their player profiles (both leagues).
+  const profiles = [];
+  for (const B of LEAGUE_BASES) {
+    const db = getAt(root, [...B, 'data', 'playerdb']) || {};
+    for (const k of Object.keys(db)) {
+      const p = db[k] || {};
+      if ((rid && String(p.robloxId || '') === rid) || (discordId && String(p.discordId || '') === discordId)) profiles.push([B, k]);
+    }
+  }
+  if (!acct && !profiles.length && !rid) return null;
+  let ended = 0;
+  for (const [k, v] of Object.entries(sessions)) if (v && !v.relink && rid && String(v.robloxId) === rid) { delete sessions[k]; ended++; }
+  if (action !== 'delete') { saveSessions(); return { action, sessionsEnded: ended, robloxId: rid || null, found: !!acct }; }
+  // Delete: sessions (incl. relink tokens for this account), account, alt records.
+  for (const [k, v] of Object.entries(sessions)) if (v && v.relink && rid && String(v.oldRobloxId) === rid) delete sessions[k];
+  if (rid) root = setAt(root, ['accounts', rid], null);
+  alts.forget([rid && 'r:' + rid, discordId && 'd:' + discordId].filter(Boolean), discordId);
+  // Keep the league record, but anonymous.
+  const NAME = 'Deleted Player';
+  for (const [B, k] of profiles) {
+    const old = getAt(root, [...B, 'data', 'playerdb', k]) || {};
+    // Off any current roster; past games still show the team they played for.
+    const keep = { name: NAME, code: '', pos: '', num: old.num || '', deleted: true, deletedAt: Date.now() };
+    root = setAt(root, [...B, 'data', 'playerdb', k], keep);
+    const box = getAt(root, [...B, 'boxscores']) || {};
+    for (const sid of Object.keys(box)) for (const wk of Object.keys(box[sid] || {})) for (const gid of Object.keys(box[sid][wk] || {}))
+      for (const side of ['teamA', 'teamB']) if (box[sid][wk][gid] && box[sid][wk][gid][side] && box[sid][wk][gid][side][k])
+        root = setAt(root, [...B, 'boxscores', sid, wk, gid, side, k, 'name'], NAME);
+    const aw = getAt(root, [...B, 'awards']) || {};
+    for (const sid of Object.keys(aw)) {
+      const list = aw[sid] && aw[sid].list; if (!list) continue;
+      for (const i of Object.keys(list)) if (list[i] && list[i].playerId === k && list[i].name) root = setAt(root, [...B, 'awards', sid, 'list', i, 'name'], NAME);
+    }
+  }
+  saveSessions(); scheduleSave();
+  return { action, sessionsEnded: ended, robloxId: rid || null, found: !!acct, profiles: profiles.length };
 }
 
 // Does a player record have league history (box score lines or awards)? Used before merging.
