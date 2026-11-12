@@ -378,7 +378,8 @@ async function finishRobloxLogin(req, pending, robloxId, info, opts = {}) {
       return E('That Discord account is already linked to another player.');
   }
   const ip = alts.clientIp(req);
-  if (!prev.robloxId && (await alts.vpnCheck(ip)).vpn) return E(VPN_MSG);   // new accounts only
+  // New accounts only; skipped for people staff let through with /vpn_allow.
+  if (!prev.robloxId && !(su && alts.vpnAllowed(su.discord.discordId)) && (await alts.vpnCheck(ip)).vpn) return E(VPN_MSG);
   // Signing in refreshes the Roblox name/avatar only for new accounts or when a sync is due,
   // so signing out and back in can't be used to skip the 24-hour sync cooldown.
   // (opts.fresh: the code-in-About check just read their profile from Roblox, so always use it.)
@@ -510,7 +511,7 @@ async function handleAuth(req, res, url) {
     const su = signupOf(body && body.signup);
     if (!su) return send(res, 401, { error: 'Your sign-up expired. Link Discord again.', expired: true });
     const ip = alts.clientIp(req);
-    if ((await alts.vpnCheck(ip)).vpn) return send(res, 403, { error: VPN_MSG, vpn: true });
+    if (!alts.vpnAllowed(su.discord.discordId) && (await alts.vpnCheck(ip)).vpn) return send(res, 403, { error: VPN_MSG, vpn: true });
     if (alts.okDevice(body.device)) su.device = body.device;
     alts.record('d:' + su.discord.discordId, ip, su.device, 'signup');
     su.checked = true;
@@ -820,6 +821,11 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/alts/confirm' && req.method === 'POST') {
         const a = alts.confirm(String(body.id), body.by ? String(body.by) : null);
         return a ? send(res, 200, a) : send(res, 404, { error: 'Alert not found' });
+      }
+      // /vpn_allow in Discord: { discordId, allow: true|false, by }
+      if (url.pathname === '/alts/vpnallow' && req.method === 'POST') {
+        const a = alts.allowVpn(body.discordId, body.allow !== false, body.by ? String(body.by) : null);
+        return a ? send(res, 200, a) : send(res, 400, { error: 'Bad Discord ID' });
       }
       if (url.pathname === '/alts/reverse' && req.method === 'POST') {
         const a = alts.reverse(String(body.id), body.by ? String(body.by) : null);
