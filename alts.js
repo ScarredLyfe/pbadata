@@ -218,6 +218,18 @@ module.exports = function makeAlts(DATA_DIR) {
     if (on) db.vpnAllow[id] = { by: by || null, at: Date.now() }; else delete db.vpnAllow[id];
     save(); return { discordId: id, allowed: !!on };
   }
+  // Privacy deletion: remove an account's network/device records, its seen marker and VPN allowance.
+  // (Alerts already posted for staff stay, as a record of the decision.)
+  function forget(keys, discordId) {
+    const ks = new Set(keys || []);
+    for (const kind of ['ip', 'dev']) for (const [h, accts] of Object.entries(db[kind])) {
+      for (const k of Object.keys(accts)) if (ks.has(k)) delete accts[k];
+      if (!Object.keys(accts).length) delete db[kind][h];
+    }
+    for (const k of Object.keys(db.seen)) if ([...ks].some(x => k.startsWith(x))) delete db.seen[k];
+    if (discordId && db.vpnAllow) delete db.vpnAllow[String(discordId)];
+    save();
+  }
   const vpnAllowed = discordId => !!(discordId && db.vpnAllow && db.vpnAllow[String(discordId)]);
   // Is this player in any alert? keys: ['d:<discordId>', 'r:<robloxId>'].
   // Alerts marked "Not an Alt" don't count. Returns the matching alerts, confirmed ones first.
@@ -231,5 +243,5 @@ module.exports = function makeAlts(DATA_DIR) {
       others: [a.flagged, ...Object.keys(a.matches || {})].filter(k => !ks.has(k)) }));
   }
 
-  return { allowVpn, vpnAllowed, record, vpnCheck, clientIp, okDevice, queue, ack, decide, reverse, confirm, get, check };
+  return { forget, allowVpn, vpnAllowed, record, vpnCheck, clientIp, okDevice, queue, ack, decide, reverse, confirm, get, check };
 };
